@@ -270,7 +270,7 @@ public class IndexAcceleratedBenchmarks
         try { File.Delete(noIdxPath); } catch { }
 
         // SQLite connection (indexed database)
-        _sqliteConn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        _sqliteConn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly;Pooling=False");
         _sqliteConn.Open();
 
         // Pick a user_id in the middle of the range for representative seeking

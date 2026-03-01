@@ -35,4 +35,4 @@ foreach (var node in result.Nodes)
 bool trusted = graph.Ledger.VerifyIntegrity();
 ```
 
-[Full Documentation](https://github.com/revred/Sharc) | [Live Arena](https://revred.github.io/Sharc/)
+[Full Documentation](https://github.com/revred/Sharc) | [Live Arena](https://revred.github.io/Sharc.Open/)

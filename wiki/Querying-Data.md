@@ -98,14 +98,119 @@ using var reader = jit.TopK(10,
 
 See the [`PrimeExample`](../samples/PrimeExample/) sample for a complete spatial query walkthrough.
 
+## JOIN Queries
+
+Sharc supports INNER, LEFT, RIGHT, FULL OUTER, and CROSS joins:
+
+```csharp
+using var reader = db.Query(
+    "SELECT u.name, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.total > 100");
+while (reader.Read())
+    Console.WriteLine($"{reader.GetString(0)}: {reader.GetDouble(1)}");
+```
+
+Supported join types: `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN`, `CROSS JOIN`.
+
+## Compound Queries (UNION / INTERSECT / EXCEPT)
+
+Combine multiple result sets:
+
+```csharp
+// UNION ALL — all rows from both queries
+using var reader = db.Query(
+    "SELECT name FROM employees UNION ALL SELECT name FROM contractors");
+
+// UNION — deduplicated rows
+using var reader2 = db.Query(
+    "SELECT name FROM employees UNION SELECT name FROM contractors");
+
+// INTERSECT — rows in both queries
+using var reader3 = db.Query(
+    "SELECT name FROM employees INTERSECT SELECT name FROM contractors");
+
+// EXCEPT — rows in first but not second
+using var reader4 = db.Query(
+    "SELECT name FROM employees EXCEPT SELECT name FROM contractors");
+```
+
+Compound queries support final `ORDER BY` and `LIMIT` clauses.
+
+## GROUP BY and Aggregates
+
+```csharp
+using var reader = db.Query(
+    "SELECT dept, COUNT(*) AS cnt, AVG(salary) AS avg_sal FROM users GROUP BY dept ORDER BY cnt DESC");
+while (reader.Read())
+    Console.WriteLine($"{reader.GetString(0)}: {reader.GetInt64(1)} employees, avg ${reader.GetDouble(2):F2}");
+```
+
+Supported aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`.
+
+## Common Table Expressions (Cotes)
+
+```csharp
+using var reader = db.Query(
+    "WITH active AS (SELECT id, name FROM users WHERE active = 1) " +
+    "SELECT * FROM active WHERE id > 100");
+
+// Cotes with compound queries
+using var reader2 = db.Query(
+    "WITH team_a AS (SELECT name FROM users WHERE dept = 'A'), " +
+    "     team_b AS (SELECT name FROM users WHERE dept = 'B') " +
+    "SELECT * FROM team_a UNION ALL SELECT * FROM team_b");
+```
+
+## ORDER BY, LIMIT, OFFSET
+
+```csharp
+using var reader = db.Query(
+    "SELECT id, name FROM users ORDER BY name ASC LIMIT 20 OFFSET 40");
+```
+
+Multi-column sort and streaming TopN heap are used for efficient ordering.
+
+## Prepared Queries
+
+Pre-compile a query for zero-overhead repeated execution:
+
+```csharp
+using var prepared = db.Prepare("SELECT id, name FROM users WHERE age > $minAge");
+
+// Execute multiple times with different parameters
+var young = new Dictionary<string, object> { ["$minAge"] = 18L };
+using var r1 = prepared.Execute(young);
+
+var senior = new Dictionary<string, object> { ["$minAge"] = 65L };
+using var r2 = prepared.Execute(senior);
+
+// Or execute without parameters
+using var r3 = prepared.Execute();
+```
+
+## Execution Hints
+
+Route queries through cached or JIT-compiled execution paths:
+
+```csharp
+// Use cached plan
+using var reader = db.Query("/*+ CACHED */ SELECT * FROM users WHERE active = 1");
+
+// Use JIT execution
+using var reader2 = db.Query("/*+ JIT */ SELECT * FROM users WHERE age > 30");
+```
+
 ## Supported Syntax
 
 Sharq supports:
-- `SELECT` with column projection
-- `WHERE` with comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`)
+- `SELECT` with column projection and `SELECT *`
+- `WHERE` with comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`), `LIKE`, `IN`, `BETWEEN`, `IS NULL`
 - `AND` / `OR` logical operators
+- `JOIN` — INNER, LEFT, RIGHT, FULL OUTER, CROSS
+- `UNION ALL` / `UNION` / `INTERSECT` / `EXCEPT`
+- `GROUP BY` with `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
+- `ORDER BY` with multi-column sort and streaming TopN
+- `LIMIT` / `OFFSET`
+- `WITH` (Common Table Expressions / Cotes)
 - Parameterized values (`$param`)
-- `JOIN` (inner joins via the query pipeline)
-- `ORDER BY` (via cursor-based sorting)
 - `TopK` with custom scoring (via `JitQuery.TopK()`)
 - Table and column name resolution (case-insensitive)

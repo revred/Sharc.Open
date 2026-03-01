@@ -45,7 +45,7 @@ internal static class SharcDatabaseFactory
         var data = new byte[pageSize * 5];
 
         // 1. Database Header
-        var dbHeader = new DatabaseHeader(pageSize, 1, 1, 0, 1, 4, 0, 0, 1, 4, 1, 0, 0, 3042000);
+        var dbHeader = new DatabaseHeader(pageSize, 1, 1, 0, 1, 5, 0, 0, 1, 4, 1, 0, 0, 3042000);
         DatabaseHeader.Write(data, dbHeader);
 
         // System table schema

@@ -165,15 +165,14 @@ internal static class CellBuilder
     }
 
     /// <summary>
-    /// Pre-computes the total cell size for an index interior cell without writing it.
+    /// Pre-computes the total cell size for an index leaf cell without writing it.
     /// </summary>
     /// <param name="recordPayloadSize">Total index record payload size in bytes.</param>
     /// <param name="usablePageSize">Usable page size.</param>
     /// <returns>Total cell size in bytes.</returns>
-    public static int ComputeIndexInteriorCellSize(int recordPayloadSize, int usablePageSize)
+    public static int ComputeIndexLeafCellSize(int recordPayloadSize, int usablePageSize)
     {
-        int size = 4 // left child page pointer
-                 + VarintDecoder.GetEncodedLength(recordPayloadSize);
+        int size = VarintDecoder.GetEncodedLength(recordPayloadSize);
 
         int inlineSize = IndexCellParser.CalculateIndexInlinePayloadSize(
             recordPayloadSize, usablePageSize);
@@ -186,14 +185,15 @@ internal static class CellBuilder
     }
 
     /// <summary>
-    /// Pre-computes the total cell size for an index leaf cell without writing it.
+    /// Pre-computes the total cell size for an index interior cell without writing it.
     /// </summary>
     /// <param name="recordPayloadSize">Total index record payload size in bytes.</param>
     /// <param name="usablePageSize">Usable page size.</param>
     /// <returns>Total cell size in bytes.</returns>
-    public static int ComputeIndexLeafCellSize(int recordPayloadSize, int usablePageSize)
+    public static int ComputeIndexInteriorCellSize(int recordPayloadSize, int usablePageSize)
     {
-        int size = VarintDecoder.GetEncodedLength(recordPayloadSize);
+        int size = 4 // left child page pointer
+                 + VarintDecoder.GetEncodedLength(recordPayloadSize);
 
         int inlineSize = IndexCellParser.CalculateIndexInlinePayloadSize(
             recordPayloadSize, usablePageSize);

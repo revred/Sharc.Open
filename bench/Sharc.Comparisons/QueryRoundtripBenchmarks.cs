@@ -44,15 +44,11 @@ public class QueryRoundtripBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        var dir = Path.Combine(Path.GetTempPath(), "sharc_roundtrip_bench");
-        Directory.CreateDirectory(dir);
-        _dbPath = Path.Combine(dir, "roundtrip_bench.db");
+        _dbPath = BenchmarkTempDb.CreatePath("roundtrip");
+        RoundtripDataGenerator.Generate(_dbPath, rowsPerTable: 2500, overlapStart: 2001);
+        _dbBytes = BenchmarkTempDb.ReadAllBytesWithRetry(_dbPath);
 
-        if (!File.Exists(_dbPath))
-            RoundtripDataGenerator.Generate(_dbPath, rowsPerTable: 2500, overlapStart: 2001);
-        _dbBytes = File.ReadAllBytes(_dbPath);
-
-        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly;Pooling=False");
         _conn.Open();
 
         _sharcDb = SharcDatabase.OpenMemory(_dbBytes, new SharcOpenOptions { PageCacheSize = 100 });
@@ -69,6 +65,7 @@ public class QueryRoundtripBenchmarks
     {
         _sharcDb?.Dispose();
         _conn?.Dispose();
+        BenchmarkTempDb.TryDelete(_dbPath);
     }
 
     // ═══════════════════════════════════════════════════════════════

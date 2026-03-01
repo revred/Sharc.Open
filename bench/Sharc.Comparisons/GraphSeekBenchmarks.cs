@@ -35,15 +35,11 @@ public class GraphSeekBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        var dir = Path.Combine(Path.GetTempPath(), "sharc_graph_bench");
-        Directory.CreateDirectory(dir);
-        _dbPath = Path.Combine(dir, "graph_seek_bench.db");
+        _dbPath = BenchmarkTempDb.CreatePath("graph_seek");
+        GraphGenerator.GenerateSQLite(_dbPath, nodeCount: 5000, edgeCount: 15000);
+        _dbBytes = BenchmarkTempDb.ReadAllBytesWithRetry(_dbPath);
 
-        if (!File.Exists(_dbPath))
-            GraphGenerator.GenerateSQLite(_dbPath, nodeCount: 5000, edgeCount: 15000);
-        _dbBytes = File.ReadAllBytes(_dbPath);
-
-        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly;Pooling=False");
         _conn.Open();
 
         _seekCmd = _conn.CreateCommand();
@@ -79,6 +75,7 @@ public class GraphSeekBenchmarks
     {
         _seekCmd?.Dispose();
         _conn?.Dispose();
+        BenchmarkTempDb.TryDelete(_dbPath);
     }
 
     // --- Single node lookup by rowid ---
@@ -168,7 +165,7 @@ public class GraphSeekBenchmarks
     [BenchmarkCategory("OpenSeekClose")]
     public string? SQLite_OpenSeekClose()
     {
-        using var conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        using var conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly;Pooling=False");
         conn.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT id FROM _concepts WHERE key = 2500";

@@ -55,15 +55,11 @@ public class CoreBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        var dir = Path.Combine(Path.GetTempPath(), "sharc_core_bench");
-        Directory.CreateDirectory(dir);
-        _dbPath = Path.Combine(dir, "core_bench.db");
+        _dbPath = BenchmarkTempDb.CreatePath("core_bench");
+        CoreDataGenerator.GenerateSQLite(_dbPath, userCount: 5000);
+        _dbBytes = BenchmarkTempDb.ReadAllBytesWithRetry(_dbPath);
 
-        if (!File.Exists(_dbPath))
-            CoreDataGenerator.GenerateSQLite(_dbPath, userCount: 5000);
-        _dbBytes = File.ReadAllBytes(_dbPath);
-
-        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly;Pooling=False");
         _conn.Open();
 
         // Pre-compile the Baked filter for fair comparison (bypass delegate construction overhead per call)
@@ -118,6 +114,7 @@ public class CoreBenchmarks
         _sqlitePreparedPoint?.Dispose();
         _conn?.Dispose();
         _sharcDb?.Dispose();
+        BenchmarkTempDb.TryDelete(_dbPath);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -137,7 +134,7 @@ public class CoreBenchmarks
     [BenchmarkCategory("EngineLoad")]
     public SqliteConnection SQLite_EngineLoad()
     {
-        var conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        var conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly;Pooling=False");
         conn.Open();
         // Force schema load
         using var cmd = conn.CreateCommand();

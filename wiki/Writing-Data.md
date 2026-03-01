@@ -128,6 +128,66 @@ CREATE TABLE merged_values (
 );
 ```
 
+## Upsert (Insert or Replace)
+
+Insert a row or replace it if the rowid already exists:
+
+```csharp
+// Insert if rowid 42 doesn't exist, replace if it does
+long rowId = writer.Upsert("users", 42,
+    ColumnValue.FromInt64(1, 42),
+    ColumnValue.Text(13, "Alice Updated"u8.ToArray()),
+    ColumnValue.Text(13, "alice@example.com"u8.ToArray())
+);
+```
+
+## Bulk Delete with Filter
+
+Delete all rows matching a predicate:
+
+```csharp
+// Delete all inactive users
+int deletedCount = writer.DeleteWhere("users",
+    FilterStar.Column("active").Eq(0L));
+
+Console.WriteLine($"Removed {deletedCount} inactive users");
+```
+
+## PreparedWriter
+
+Zero-overhead repeated writes with thread-safe cursor reuse:
+
+```csharp
+using var prepared = writer.PrepareWriter("users");
+
+// Insert multiple rows — cursor is reused, no per-call allocation
+long id1 = prepared.Insert(
+    ColumnValue.FromInt64(1, 1),
+    ColumnValue.Text(13, "Alice"u8.ToArray()));
+
+long id2 = prepared.Insert(
+    ColumnValue.FromInt64(1, 2),
+    ColumnValue.Text(13, "Bob"u8.ToArray()));
+
+// Update and delete also supported
+prepared.Update(id1,
+    ColumnValue.FromInt64(1, 1),
+    ColumnValue.Text(13, "Alice V2"u8.ToArray()));
+
+prepared.Delete(id2);
+```
+
+## CREATE INDEX
+
+Create indexes on existing tables with data (Phase 2 — v1.2.77+):
+
+```csharp
+writer.CreateIndex("idx_users_email", "users", "email");
+writer.CreateIndex("idx_users_age", "users", "age", unique: false);
+```
+
+Uses `IndexBTreePopulator` for sorted bulk-insert with proper SQLite type ordering.
+
 ## Vacuum
 
 Compact the database by reclaiming free pages:

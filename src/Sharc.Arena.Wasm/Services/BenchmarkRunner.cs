@@ -207,7 +207,7 @@ public sealed class BenchmarkRunner : IBenchmarkEngine
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Runner] IndexedDB init failed: {ex.Message}");
+            Console.WriteLine($"[Runner] IndexedDB init failed: {ex}");
         }
     }
 

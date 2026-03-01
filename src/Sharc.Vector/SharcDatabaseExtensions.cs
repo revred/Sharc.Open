@@ -56,7 +56,11 @@ public static class SharcDatabaseExtensions
                 if (!probe.Read())
                     throw new InvalidOperationException(
                         $"Table '{tableName}' is empty — cannot determine vector dimensions.");
-                dimensions = BlobVectorCodec.GetDimensions(probe.GetBlobSpan(0).Length);
+                var blob = probe.GetBlobSpan(0);
+                if (!BlobVectorCodec.TryDecode(blob, out ReadOnlySpan<float> decoded) || decoded.Length == 0)
+                    throw new InvalidOperationException(
+                        $"Column '{vectorColumn}' in table '{tableName}' contains an invalid vector payload at rowid {probe.RowId}.");
+                dimensions = decoded.Length;
             }
 
             return new VectorQuery(db, jit, tableName, vectorColumn, dimensions, metric);
@@ -147,7 +151,11 @@ public static class SharcDatabaseExtensions
                 if (!probe.Read())
                     throw new InvalidOperationException(
                         $"Table '{tableName}' is empty — cannot determine vector dimensions.");
-                dimensions = BlobVectorCodec.GetDimensions(probe.GetBlobSpan(0).Length);
+                var blob = probe.GetBlobSpan(0);
+                if (!BlobVectorCodec.TryDecode(blob, out ReadOnlySpan<float> decoded) || decoded.Length == 0)
+                    throw new InvalidOperationException(
+                        $"Column '{vectorColumn}' in table '{tableName}' contains an invalid vector payload at rowid {probe.RowId}.");
+                dimensions = decoded.Length;
             }
 
             textJit = db.Jit(tableName);

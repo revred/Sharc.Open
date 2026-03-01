@@ -33,6 +33,11 @@ internal static class SharcSchemaWriter
         {
             ExecuteCreateTable(db, tx, span, sql);
         }
+        else if (span.StartsWith("CREATE UNIQUE INDEX", StringComparison.OrdinalIgnoreCase)
+              || span.StartsWith("CREATE INDEX", StringComparison.OrdinalIgnoreCase))
+        {
+            ExecuteCreateIndex(db, tx, span, sql);
+        }
         else if (span.StartsWith("CREATE VIEW", StringComparison.OrdinalIgnoreCase))
         {
             ExecuteCreateView(db, tx, span, sql);

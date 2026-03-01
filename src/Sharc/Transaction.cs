@@ -22,6 +22,7 @@ public sealed class Transaction : IDisposable
     private readonly bool _ownsShadow; // false when shadow is pooled by SharcWriter
     private Dictionary<string, HashSet<long>>? _rowMutations;
     private BTreeMutator? _mutator;
+    private IndexBTreeMutator? _indexMutator;
     private FreelistManager? _freelistManager;
     private bool _isCompleted;
     private bool _disposed;
@@ -57,6 +58,28 @@ public sealed class Transaction : IDisposable
         _mutator = new BTreeMutator(_shadowSource, usablePageSize,
             freePageAllocator, _freelistManager.PushFreePage);
         return _mutator;
+    }
+
+    /// <summary>
+    /// Returns a cached <see cref="IndexBTreeMutator"/> for this transaction.
+    /// Shares the freelist and page number allocator with the table mutator
+    /// to prevent both mutators from allocating the same page numbers.
+    /// </summary>
+    internal IndexBTreeMutator FetchIndexMutator(int usablePageSize)
+    {
+        if (_indexMutator != null)
+            return _indexMutator;
+
+        // Ensure table mutator + freelist are initialized
+        var tableMutator = FetchMutator(usablePageSize);
+
+        Func<uint>? freePageAllocator = _freelistManager!.HasFreePages ? _freelistManager.PopFreePage : null;
+
+        // Share the page number allocator with the table mutator so both
+        // use the same counter when extending the database file.
+        _indexMutator = new IndexBTreeMutator(_shadowSource, usablePageSize,
+            freePageAllocator, tableMutator.AllocateNextPage);
+        return _indexMutator;
     }
 
     internal Transaction(SharcDatabase db, IWritablePageSource baseSource)
@@ -104,6 +127,8 @@ public sealed class Transaction : IDisposable
             // Release mutator page buffers before flushing dirty pages.
             _mutator?.Dispose();
             _mutator = null;
+            _indexMutator?.Dispose();
+            _indexMutator = null;
 
             if (_shadowSource.DirtyPageCount == 0)
             {
@@ -151,6 +176,8 @@ public sealed class Transaction : IDisposable
         if (_disposed || _isCompleted) return;
         _mutator?.Dispose();
         _mutator = null;
+        _indexMutator?.Dispose();
+        _indexMutator = null;
         _rowMutations?.Clear();
         _shadowSource.ClearShadow();
         _isCompleted = true;
@@ -298,6 +325,8 @@ public sealed class Transaction : IDisposable
         }
         _mutator?.Dispose();
         _mutator = null;
+        _indexMutator?.Dispose();
+        _indexMutator = null;
         if (_ownsShadow)
             _shadowSource.Dispose();
         _disposed = true;

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using Sharc.Core.Trust;
 using Sharc.Trust;
 using Sharc.Vector.Hnsw;
@@ -80,6 +81,10 @@ public sealed class VectorQuery : IDisposable
     // ── HNSW Index ────────────────────────────────────────────────
 
     private HnswIndex? _hnswIndex;
+    // Below this threshold, flat scan is preferred over HNSW graph traversal.
+    // At 256 vectors, flat scan costs ~12us (256 * ~50ns SIMD). HNSW overhead
+    // (lock, multi-layer descent, beam search) is comparable or higher.
+    internal const int SmallDatasetFlatScanThreshold = 256;
     private const int PostFilterSelectivityMultiplier = 2;
     private const int PostFilterMinCandidateThreshold = 8;
     private const int WithinDistanceInitialCandidateCount = 32;
@@ -184,7 +189,9 @@ public sealed class VectorQuery : IDisposable
         }
 
         // HNSW fast path: when index is attached AND no filters/row evaluator/metadata requested
-        bool canUseHnsw = _hnswIndex != null && !_innerJit.HasActiveFilters && !_innerJit.HasRowAccessEvaluator;
+        // Small datasets fall through to flat scan — graph traversal overhead exceeds brute force.
+        bool canUseHnsw = _hnswIndex != null && !_innerJit.HasActiveFilters && !_innerJit.HasRowAccessEvaluator
+            && _hnswIndex.Count >= SmallDatasetFlatScanThreshold;
 
         if (canUseHnsw && columnNames.Length == 0)
         {
@@ -215,7 +222,8 @@ public sealed class VectorQuery : IDisposable
         }
 
         // Filter-aware HNSW path: build filtered allow-list then widen ANN candidates.
-        if (_hnswIndex != null && _innerJit.HasActiveFilters && !_innerJit.HasRowAccessEvaluator)
+        if (_hnswIndex != null && _innerJit.HasActiveFilters && !_innerJit.HasRowAccessEvaluator
+            && _hnswIndex.Count >= SmallDatasetFlatScanThreshold)
         {
             var indexed = IndexedPostFilterNearestTo(queryVector, k, options, columnNames);
             StampElapsed(startTimestamp);
@@ -427,9 +435,7 @@ public sealed class VectorQuery : IDisposable
         {
             scannedRows++;
 
-            // Zero-copy: BlobSpan points directly into cached page buffer
-            ReadOnlySpan<byte> blobBytes = reader.GetBlobSpan(0);
-            ReadOnlySpan<float> storedVector = BlobVectorCodec.Decode(blobBytes);
+            ReadOnlySpan<float> storedVector = DecodeAndValidateStoredVector(reader);
 
             float distance = _distanceFn(queryVector, storedVector);
             long rowid = reader.RowId;
@@ -628,7 +634,8 @@ public sealed class VectorQuery : IDisposable
             return forcedFlat;
         }
 
-        if (_hnswIndex != null && !_innerJit.HasRowAccessEvaluator)
+        if (_hnswIndex != null && !_innerJit.HasRowAccessEvaluator
+            && _hnswIndex.Count >= SmallDatasetFlatScanThreshold)
         {
             var indexed = IndexedWithinDistance(queryVector, maxDistance, options, columnNames);
             StampElapsed(startTimestamp);
@@ -664,8 +671,7 @@ public sealed class VectorQuery : IDisposable
         {
             scannedRows++;
 
-            ReadOnlySpan<byte> blobBytes = reader.GetBlobSpan(0);
-            ReadOnlySpan<float> storedVector = BlobVectorCodec.Decode(blobBytes);
+            ReadOnlySpan<float> storedVector = DecodeAndValidateStoredVector(reader);
 
             float distance = _distanceFn(queryVector, storedVector);
             if (IsWithinThreshold(distance, maxDistance))
@@ -883,6 +889,29 @@ public sealed class VectorQuery : IDisposable
         }
         return dict;
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ReadOnlySpan<float> DecodeAndValidateStoredVector(SharcDataReader reader)
+    {
+        ReadOnlySpan<byte> blob = reader.GetBlobSpan(0);
+        if (!BlobVectorCodec.TryDecode(blob, out ReadOnlySpan<float> vector))
+            ThrowInvalidVectorPayload(reader.RowId, blob.Length);
+
+        if (vector.Length != _dimensions)
+            ThrowVectorDimensionMismatch(reader.RowId, vector.Length);
+
+        return vector;
+    }
+
+    private void ThrowInvalidVectorPayload(long rowId, int byteLength) =>
+        throw new InvalidOperationException(
+            $"Row {rowId} in table '{_innerJit.Table!.Name}' has an invalid vector payload " +
+            $"length ({byteLength} bytes).");
+
+    private void ThrowVectorDimensionMismatch(long rowId, int foundDimensions) =>
+        throw new InvalidOperationException(
+            $"Row {rowId} in table '{_innerJit.Table!.Name}' has {foundDimensions} dimensions " +
+            $"but this query expects {_dimensions}.");
 
     /// <summary>
     /// Extracts metadata from a reader where all projected columns are metadata

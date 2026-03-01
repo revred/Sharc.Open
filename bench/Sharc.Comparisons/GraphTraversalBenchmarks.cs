@@ -35,15 +35,11 @@ public class GraphTraversalBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        var dir = Path.Combine(Path.GetTempPath(), "sharc_graph_traversal");
-        Directory.CreateDirectory(dir);
-        _dbPath = Path.Combine(dir, "graph_traversal.db");
+        _dbPath = BenchmarkTempDb.CreatePath("graph_traversal");
+        GraphGenerator.GenerateSQLite(_dbPath, nodeCount: 5000, edgeCount: 15000);
+        _dbBytes = BenchmarkTempDb.ReadAllBytesWithRetry(_dbPath);
 
-        if (!File.Exists(_dbPath))
-            GraphGenerator.GenerateSQLite(_dbPath, nodeCount: 5000, edgeCount: 15000);
-        _dbBytes = File.ReadAllBytes(_dbPath);
-
-        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly;Pooling=False");
         _conn.Open();
 
         // Sharc Setup
@@ -65,6 +61,7 @@ public class GraphTraversalBenchmarks
     {
         _conn?.Dispose();
         _graph?.Dispose();
+        BenchmarkTempDb.TryDelete(_dbPath);
     }
 
     [Benchmark]

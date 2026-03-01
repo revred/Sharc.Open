@@ -22,19 +22,16 @@ namespace Sharc.Comparisons;
 [MemoryDiagnoser]
 public class ViewBenchmarks
 {
+    private string _dbPath = null!;
     private byte[] _dbBytes = null!;
     private SharcDatabase _sharcDb = null!;
 
     [GlobalSetup]
     public void Setup()
     {
-        var dir = Path.Combine(Path.GetTempPath(), "sharc_view_bench");
-        Directory.CreateDirectory(dir);
-        var dbPath = Path.Combine(dir, "view_bench.db");
-
-        if (!File.Exists(dbPath))
-            CoreDataGenerator.GenerateSQLite(dbPath, userCount: 5000);
-        _dbBytes = File.ReadAllBytes(dbPath);
+        _dbPath = BenchmarkTempDb.CreatePath("view");
+        CoreDataGenerator.GenerateSQLite(_dbPath, userCount: 5000);
+        _dbBytes = BenchmarkTempDb.ReadAllBytesWithRetry(_dbPath);
 
         _sharcDb = SharcDatabase.OpenMemory(_dbBytes, new SharcOpenOptions { PageCacheSize = 100 });
 
@@ -72,6 +69,7 @@ public class ViewBenchmarks
     public void Cleanup()
     {
         _sharcDb?.Dispose();
+        BenchmarkTempDb.TryDelete(_dbPath);
     }
 
     // ═══════════════════════════════════════════════════════════════

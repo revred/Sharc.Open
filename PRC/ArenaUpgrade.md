@@ -905,7 +905,7 @@ Several current sizes are too small for mobile:
 After benchmarks complete, generate a URL with encoded results:
 
 ```
-https://revred.github.io/Sharc/#results=eyJlbmdpbmVMb2FkIjp7InNoYXJjIjo0LjAsInNxbGl0ZSI6MTQyMDAwfSwic2NoZW1hUmVhZCI6ey4uLn19
+https://revred.github.io/Sharc.Open/#results=eyJlbmdpbmVMb2FkIjp7InNoYXJjIjo0LjAsInNxbGl0ZSI6MTQyMDAwfSwic2NoZW1hUmVhZCI6ey4uLn19
 ```
 
 **Implementation:**

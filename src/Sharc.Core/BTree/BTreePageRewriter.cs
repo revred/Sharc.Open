@@ -163,10 +163,39 @@ internal sealed class BTreePageRewriter
 
     /// <summary>
     /// Measures the byte length of a cell starting at the given position.
+    /// Dispatches to table or index cell format based on page type.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int MeasureCell(ReadOnlySpan<byte> cellData, bool isLeaf)
+        => MeasureCell(cellData, isLeaf, isIndex: false);
+
+    /// <summary>
+    /// Measures the byte length of a cell starting at the given position.
+    /// Dispatches to table or index cell format based on <paramref name="isIndex"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int MeasureCell(ReadOnlySpan<byte> cellData, bool isLeaf, bool isIndex)
     {
+        if (isIndex)
+        {
+            if (isLeaf)
+            {
+                int off = IndexCellParser.ParseIndexLeafCell(cellData, out int payloadSize);
+                int inlineSize = IndexCellParser.CalculateIndexInlinePayloadSize(payloadSize, _usablePageSize);
+                int total = off + inlineSize;
+                if (inlineSize < payloadSize) total += 4;
+                return total;
+            }
+            else
+            {
+                int off = IndexCellParser.ParseIndexInteriorCell(cellData, out _, out int payloadSize);
+                int inlineSize = IndexCellParser.CalculateIndexInlinePayloadSize(payloadSize, _usablePageSize);
+                int total = off + inlineSize;
+                if (inlineSize < payloadSize) total += 4;
+                return total;
+            }
+        }
+
         if (isLeaf)
         {
             int off = CellParser.ParseTableLeafCell(cellData, out int payloadSize, out _);
@@ -179,6 +208,56 @@ internal sealed class BTreePageRewriter
         {
             return CellParser.ParseTableInteriorCell(cellData, out _, out _);
         }
+    }
+
+    /// <summary>
+    /// Collects all index cells from a page plus the new cell at the insertion point.
+    /// Uses index-specific cell measurement.
+    /// </summary>
+    public (byte[] cellBuf, int refCount) GatherIndexCellsWithInsertion(byte[] pageBuf, int hdrOff,
+        BTreePageHeader hdr, int insertIdx, ReadOnlySpan<byte> newCell)
+    {
+        var pageSpan = pageBuf.AsSpan();
+        bool isLeaf = hdr.IsLeaf;
+
+        int totalBytes = newCell.Length;
+        for (int i = 0; i < hdr.CellCount; i++)
+        {
+            int cellPtr = hdr.GetCellPointer(pageSpan[hdrOff..], i);
+            totalBytes += MeasureCell(pageSpan[cellPtr..], isLeaf, isIndex: true);
+        }
+
+        var buffer = ArrayPool<byte>.Shared.Rent(totalBytes);
+        _rentedBuffers.Add(buffer);
+
+        EnsureCellRefCapacity(hdr.CellCount + 1);
+
+        int refCount = 0;
+        int writeOff = 0;
+
+        for (int i = 0; i < insertIdx; i++)
+        {
+            int cellPtr = hdr.GetCellPointer(pageSpan[hdrOff..], i);
+            int cellLen = MeasureCell(pageSpan[cellPtr..], isLeaf, isIndex: true);
+            pageSpan.Slice(cellPtr, cellLen).CopyTo(buffer.AsSpan(writeOff));
+            _cellRefBuffer[refCount++] = new CellRef(writeOff, cellLen);
+            writeOff += cellLen;
+        }
+
+        newCell.CopyTo(buffer.AsSpan(writeOff));
+        _cellRefBuffer[refCount++] = new CellRef(writeOff, newCell.Length);
+        writeOff += newCell.Length;
+
+        for (int i = insertIdx; i < hdr.CellCount; i++)
+        {
+            int cellPtr = hdr.GetCellPointer(pageSpan[hdrOff..], i);
+            int cellLen = MeasureCell(pageSpan[cellPtr..], isLeaf, isIndex: true);
+            pageSpan.Slice(cellPtr, cellLen).CopyTo(buffer.AsSpan(writeOff));
+            _cellRefBuffer[refCount++] = new CellRef(writeOff, cellLen);
+            writeOff += cellLen;
+        }
+
+        return (buffer, refCount);
     }
 
     /// <summary>Builds a leaf table page from a span of cell descriptors in a contiguous buffer.</summary>
@@ -298,6 +377,7 @@ internal sealed class BTreePageRewriter
         var pageSpan = pageBuf.AsSpan();
         int headerSize = hdr.HeaderSize;
         int ptrBase = hdrOff + headerSize;
+        bool isIndex = !hdr.IsTable;
 
         for (int i = cellIndex; i < hdr.CellCount - 1; i++)
         {
@@ -323,7 +403,7 @@ internal sealed class BTreePageRewriter
         {
             ushort ptr = BinaryPrimitives.ReadUInt16BigEndian(pageSpan[(ptrBase + i * 2)..]);
             if (ptr < newCellContentOffset) newCellContentOffset = ptr;
-            totalCellBytes += MeasureCell(pageSpan[ptr..], hdr.IsLeaf);
+            totalCellBytes += MeasureCell(pageSpan[ptr..], hdr.IsLeaf, isIndex);
         }
 
         int cellContentAreaSize = _usablePageSize - newCellContentOffset;
@@ -335,7 +415,7 @@ internal sealed class BTreePageRewriter
             for (int i = 0; i < newCellCount; i++)
             {
                 int ptr = BinaryPrimitives.ReadUInt16BigEndian(pageSpan[(ptrBase + i * 2)..]);
-                totalCellBytesForDefrag += MeasureCell(pageSpan[ptr..], hdr.IsLeaf);
+                totalCellBytesForDefrag += MeasureCell(pageSpan[ptr..], hdr.IsLeaf, isIndex);
             }
 
             var defragBuf = ArrayPool<byte>.Shared.Rent(totalCellBytesForDefrag);
@@ -347,12 +427,16 @@ internal sealed class BTreePageRewriter
             for (int i = 0; i < newCellCount; i++)
             {
                 int ptr = BinaryPrimitives.ReadUInt16BigEndian(pageSpan[(ptrBase + i * 2)..]);
-                int len = MeasureCell(pageSpan[ptr..], hdr.IsLeaf);
+                int len = MeasureCell(pageSpan[ptr..], hdr.IsLeaf, isIndex);
                 pageSpan.Slice(ptr, len).CopyTo(defragBuf.AsSpan(writeOff));
                 _cellRefBuffer[defragRefCount++] = new CellRef(writeOff, len);
                 writeOff += len;
             }
-            BuildLeafPage(pageBuf, hdrOff, defragBuf, new ReadOnlySpan<CellRef>(_cellRefBuffer, 0, defragRefCount));
+            var defragCells = new ReadOnlySpan<CellRef>(_cellRefBuffer, 0, defragRefCount);
+            if (isIndex)
+                BuildIndexLeafPage(pageBuf, hdrOff, defragBuf, defragCells);
+            else
+                BuildLeafPage(pageBuf, hdrOff, defragBuf, defragCells);
             return;
         }
 
@@ -374,13 +458,14 @@ internal sealed class BTreePageRewriter
     {
         var pageSpan = pageBuf.AsSpan();
         int ptrBase = hdrOff + hdr.HeaderSize;
+        bool isIndex = !hdr.IsTable;
 
         // Measure total cell bytes and collect descriptors into _cellRefBuffer
         int totalCellBytes = 0;
         for (int i = 0; i < hdr.CellCount; i++)
         {
             int ptr = hdr.GetCellPointer(pageSpan[hdrOff..], i);
-            totalCellBytes += MeasureCell(pageSpan[ptr..], hdr.IsLeaf);
+            totalCellBytes += MeasureCell(pageSpan[ptr..], hdr.IsLeaf, isIndex);
         }
 
         var defragBuf = ArrayPool<byte>.Shared.Rent(totalCellBytes);
@@ -391,7 +476,7 @@ internal sealed class BTreePageRewriter
         for (int i = 0; i < hdr.CellCount; i++)
         {
             int ptr = hdr.GetCellPointer(pageSpan[hdrOff..], i);
-            int len = MeasureCell(pageSpan[ptr..], hdr.IsLeaf);
+            int len = MeasureCell(pageSpan[ptr..], hdr.IsLeaf, isIndex);
             pageSpan.Slice(ptr, len).CopyTo(defragBuf.AsSpan(writeOff));
             _cellRefBuffer[i] = new CellRef(writeOff, len);
             writeOff += len;

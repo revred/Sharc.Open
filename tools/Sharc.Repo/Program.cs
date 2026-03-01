@@ -26,6 +26,13 @@ public static class Program
                 "update" => UpdateCommand.Run(args[1..]),
                 "status" => StatusCommand.Run(args[1..]),
                 "config" => ConfigCommand.Run(args[1..]),
+                "note" => NoteCommand.Run(args[1..]),
+                "annotate" => AnnotateCommand.Run(args[1..]),
+                "decide" => DecideCommand.Run(args[1..]),
+                "set" => SetCommand.Run(args[1..]),
+                "get" => GetCommand.Run(args[1..]),
+                "query" => QueryCommand.Run(args[1..]),
+                "trace-seed" => TraceSeedCommand.Run(args[1..]),
                 "scan" => ScanCommand.Run(args[1..]),
                 "feature" => FeatureCommand.Run(args[1..]),
                 "gaps" => GapsCommand.Run(args[1..]),
@@ -87,6 +94,13 @@ public static class Program
         Console.WriteLine("  update     Index git history into workspace");
         Console.WriteLine("  status     Show workspace status");
         Console.WriteLine("  config     Read/write configuration");
+        Console.WriteLine("  note       Add a free-form note");
+        Console.WriteLine("  annotate   Add a file annotation");
+        Console.WriteLine("  decide     Record an architectural decision");
+        Console.WriteLine("  set        Set a context key-value");
+        Console.WriteLine("  get        Read context key-value entries");
+        Console.WriteLine("  query      Query workspace tables");
+        Console.WriteLine("  trace-seed Build .sharc/trace-seed.json for Sharc.Trace");
         Console.WriteLine("  scan       Scan codebase into knowledge graph");
         Console.WriteLine("  feature    Feature management (list, show, add, link)");
         Console.WriteLine("  gaps       Analyze knowledge graph for coverage gaps");

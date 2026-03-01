@@ -1,4 +1,4 @@
-﻿// Copyright (c) Ram Revanur. All rights reserved.
+// Copyright (c) Ram Revanur. All rights reserved.
 // Licensed under the MIT License.
 
 using Sharc.Core;
@@ -21,6 +21,8 @@ namespace Sharc;
 /// <para>Thread-safe: each thread gets its own cursor+reader+paramCache via
 /// <see cref="ThreadLocal{T}"/>. A single <see cref="PreparedQuery"/> instance can be shared
 /// across N threads.</para>
+/// <para>Dispose is safe to call concurrently with Execute: Dispose acquires an exclusive
+/// write lock and waits for all active Execute calls to finish before cleaning up.</para>
 /// </remarks>
 public sealed class PreparedQuery : IPreparedReader
 {
@@ -40,6 +42,10 @@ public sealed class PreparedQuery : IPreparedReader
 
     // Per-thread execution state
     private readonly ThreadLocal<QuerySlot> _slot;
+
+    // Protects _slot access against concurrent Dispose.
+    // Execute: read lock (concurrent). Dispose: write lock (exclusive).
+    private readonly ReaderWriterLockSlim _guard = new(LockRecursionPolicy.NoRecursion);
 
     private sealed class QuerySlot : IDisposable
     {
@@ -116,93 +122,114 @@ public sealed class PreparedQuery : IPreparedReader
     /// <exception cref="ObjectDisposedException">The prepared query has been disposed.</exception>
     public SharcDataReader Execute(IReadOnlyDictionary<string, object>? parameters)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-
-        var db = _db;
-        var slot = _slot.Value ??= new QuerySlot();
-
-        // Determine filter node to use
-        IFilterNode? node = StaticFilter;
-
-        if (node == null && Intent.Filter.HasValue)
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterReadLock();
+        try
         {
-            if (ReferenceEquals(parameters, slot.LastParametersRef) && slot.LastFilterNode != null)
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            var db = _db;
+            var slot = _slot.Value ??= new QuerySlot();
+
+            // Determine filter node to use
+            IFilterNode? node = StaticFilter;
+
+            if (node == null && Intent.Filter.HasValue)
             {
-                node = slot.LastFilterNode;
+                if (ReferenceEquals(parameters, slot.LastParametersRef) && slot.LastFilterNode != null)
+                {
+                    node = slot.LastFilterNode;
+                }
+                else
+                {
+                    // Parameterized filter - check per-thread param cache
+                    slot.ParamCache ??= new Dictionary<long, IFilterNode>();
+                    long paramKey = ComputeParamCacheKey(parameters);
+                    if (!slot.ParamCache.TryGetValue(paramKey, out node))
+                    {
+                        var filterStar = IntentToFilterBridge.Build(
+                            Intent.Filter.Value, parameters, Intent.TableAlias);
+                        node = FilterTreeCompiler.CompileBaked(
+                            filterStar, Table.Columns, RowidAliasOrdinal);
+                        slot.ParamCache[paramKey] = node;
+                    }
+
+                    slot.LastParametersRef = parameters;
+                    slot.LastFilterNode = node;
+                }
+            }
+
+            // Fast path: reuse per-thread cached cursor + reader
+            if (slot.Reader != null)
+            {
+                slot.Reader.ResetForReuse(node);
+
+                if (NeedsPostProcessing)
+                    return QueryPostProcessor.Apply(slot.Reader, Intent);
+
+                return slot.Reader;
+            }
+
+            // First call on this thread: create cursor + reader, cache in slot
+            IBTreeCursor cursor;
+            if (_hasIndexSeek)
+            {
+                cursor = db.TryCreateIndexSeekCursorForPrepared(Intent, Table)
+                    ?? db.CreateTableCursorForPrepared(Table);
             }
             else
             {
-                // Parameterized filter - check per-thread param cache
-                slot.ParamCache ??= new Dictionary<long, IFilterNode>();
-                long paramKey = ComputeParamCacheKey(parameters);
-                if (!slot.ParamCache.TryGetValue(paramKey, out node))
-                {
-                    var filterStar = IntentToFilterBridge.Build(
-                        Intent.Filter.Value, parameters, Intent.TableAlias);
-                    node = FilterTreeCompiler.CompileBaked(
-                        filterStar, Table.Columns, RowidAliasOrdinal);
-                    slot.ParamCache[paramKey] = node;
-                }
-
-                slot.LastParametersRef = parameters;
-                slot.LastFilterNode = node;
+                cursor = db.CreateTableCursorForPrepared(Table);
             }
-        }
 
-        // Fast path: reuse per-thread cached cursor + reader
-        if (slot.Reader != null)
-        {
-            slot.Reader.ResetForReuse(node);
+            var reader = new SharcDataReader(cursor, db.Decoder, new SharcDataReader.CursorReaderConfig
+            {
+                Columns = Table.Columns,
+                Projection = Projection,
+                BTreeReader = db.BTreeReaderInternal,
+                TableIndexes = Table.Indexes,
+                FilterNode = node
+            });
+
+            // Cache for reuse - mark reader as owned so Dispose() resets instead of destroying
+            reader.MarkReusable();
+            slot.Cursor = cursor;
+            slot.Reader = reader;
 
             if (NeedsPostProcessing)
-                return QueryPostProcessor.Apply(slot.Reader, Intent);
+                return QueryPostProcessor.Apply(reader, Intent);
 
-            return slot.Reader;
+            return reader;
         }
-
-        // First call on this thread: create cursor + reader, cache in slot
-        IBTreeCursor cursor;
-        if (_hasIndexSeek)
+        finally
         {
-            cursor = db.TryCreateIndexSeekCursorForPrepared(Intent, Table)
-                ?? db.CreateTableCursorForPrepared(Table);
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitReadLock();
         }
-        else
-        {
-            cursor = db.CreateTableCursorForPrepared(Table);
-        }
-
-        var reader = new SharcDataReader(cursor, db.Decoder, new SharcDataReader.CursorReaderConfig
-        {
-            Columns = Table.Columns,
-            Projection = Projection,
-            BTreeReader = db.BTreeReaderInternal,
-            TableIndexes = Table.Indexes,
-            FilterNode = node
-        });
-
-        // Cache for reuse - mark reader as owned so Dispose() resets instead of destroying
-        reader.MarkReusable();
-        slot.Cursor = cursor;
-        slot.Reader = reader;
-
-        if (NeedsPostProcessing)
-            return QueryPostProcessor.Apply(reader, Intent);
-
-        return reader;
     }
 
     /// <inheritdoc/>
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
 
-        // Clean up all per-thread slots
-        foreach (var slot in _slot.Values)
-            slot.Dispose();
+        // Write lock: waits for all active Execute calls to finish before cleanup.
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterWriteLock();
+        try
+        {
+            if (_disposed) return;
+            _disposed = true;
 
-        _slot.Dispose();
+            // Clean up all per-thread slots
+            foreach (var slot in _slot.Values)
+                slot.Dispose();
+
+            _slot.Dispose();
+        }
+        finally
+        {
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitWriteLock();
+        }
+
+        if (!SharcRuntime.IsSingleThreaded) _guard.Dispose();
     }
 
     private static long ComputeParamCacheKey(IReadOnlyDictionary<string, object>? parameters)

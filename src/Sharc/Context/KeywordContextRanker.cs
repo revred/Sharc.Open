@@ -63,14 +63,12 @@ public sealed class KeywordContextRanker : IContextRanker
 
             tokenBudget -= estimatedTokens;
 
-            results.Add(new ContextNode
-            {
-                Kind = "file",
-                Path = path,
-                Content = path,
-                Confidence = confidence,
-                TokenEstimate = estimatedTokens
-            });
+            results.Add(new ContextNode(
+                Kind: ContextNodeKind.File,
+                Path: path,
+                Excerpt: path,
+                Confidence: confidence,
+                TokenEstimate: estimatedTokens));
         }
 
         return results.OrderByDescending(n => n.Confidence);

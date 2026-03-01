@@ -16,7 +16,7 @@ public sealed class HnswVectorQueryIntegrationTests : IDisposable
     private readonly string _dbPath;
     private readonly SharcDatabase _db;
     private const int VectorDim = 8;
-    private const int RowCount = 100;
+    private const int RowCount = 500;
 
     public HnswVectorQueryIntegrationTests()
     {

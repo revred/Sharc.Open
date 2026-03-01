@@ -9,8 +9,11 @@ namespace Sharc.Vector.Hnsw;
 /// </summary>
 public sealed class HnswIndex : IDisposable
 {
-    private HnswGraph _graph;
-    private IVectorResolver _resolver;
+    // Volatile: these references are replaced wholesale during MergePendingMutations (under write lock).
+    // Search (under read lock) must see the latest reference — without volatile, a CPU core could cache
+    // a stale reference and search against an old graph/resolver after a merge completes.
+    private volatile HnswGraph _graph;
+    private volatile IVectorResolver _resolver;
     private readonly VectorDistanceFunction _distanceFn;
     private readonly DistanceMetric _metric;
     private readonly HnswConfig _config;
@@ -171,16 +174,18 @@ public sealed class HnswIndex : IDisposable
         {
             long rowId = reader.RowId;
             var blobSpan = reader.GetBlobSpan(0);
-            float[] vector = BlobVectorCodec.Decode(blobSpan).ToArray();
+            if (!BlobVectorCodec.TryDecode(blobSpan, out ReadOnlySpan<float> decoded) || decoded.Length == 0)
+                throw new InvalidOperationException(
+                    $"Table '{tableName}' rowid {rowId} has an invalid vector payload length ({blobSpan.Length} bytes).");
 
             // Validate consistent dimensions
             if (expectedDims == null)
-                expectedDims = vector.Length;
-            else if (vector.Length != expectedDims.Value)
+                expectedDims = decoded.Length;
+            else if (decoded.Length != expectedDims.Value)
                 throw new InvalidOperationException(
-                    $"Vector at rowid {rowId} has {vector.Length} dimensions but expected {expectedDims.Value}.");
+                    $"Vector at rowid {rowId} has {decoded.Length} dimensions but expected {expectedDims.Value}.");
 
-            vectors.Add(vector);
+            vectors.Add(decoded.ToArray());
             rowIds.Add(rowId);
         }
 
@@ -239,7 +244,18 @@ public sealed class HnswIndex : IDisposable
             if (rowIdToIndex.TryGetValue(rowId, out int nodeIndex))
             {
                 var blobSpan = reader.GetBlobSpan(0);
-                vectors[nodeIndex] = BlobVectorCodec.Decode(blobSpan).ToArray();
+                if (!BlobVectorCodec.TryDecode(blobSpan, out ReadOnlySpan<float> decoded))
+                    throw new InvalidOperationException(
+                        $"Table '{tableName}' rowid {rowId} has an invalid vector payload length ({blobSpan.Length} bytes).");
+
+                if (decoded.Length != dimensions)
+                {
+                    throw new InvalidOperationException(
+                        $"Table '{tableName}' rowid {rowId} has {decoded.Length} dimensions, " +
+                        $"but persisted HNSW index expects {dimensions}.");
+                }
+
+                vectors[nodeIndex] = decoded.ToArray();
                 resolved++;
             }
         }

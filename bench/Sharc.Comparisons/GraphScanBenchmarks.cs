@@ -25,21 +25,43 @@ public class GraphScanBenchmarks
     private SqliteConnection _conn = null!;
     private SharcDatabase _sharcDb = null!;
 
+    // ── Prepared handles (zero-alloc hot paths) ──────────────────────
+    private PreparedReader _preparedNodes = null!;
+    private PreparedReader _preparedEdges = null!;
+    private PreparedReader _preparedEdgesProjected = null!;  // (source_key, kind, target_key) — no id TEXT decode
+    private PreparedReader _preparedNodesProjection = null!;
+    private PreparedQuery _preparedEdgeFilterZeroAlloc = null!;
+    private PreparedQuery _preparedEdgeFilterPushdown = null!;
+
+    // ── Cached static filters (avoid per-call allocation) ────────────
+    private static readonly SharcFilter[] KindEqualsFilter =
+    [
+        new SharcFilter("kind", SharcOperator.Equal, (long)15),
+    ];
+
     [GlobalSetup]
     public void Setup()
     {
-        var dir = Path.Combine(Path.GetTempPath(), "sharc_graph_bench");
-        Directory.CreateDirectory(dir);
-        _dbPath = Path.Combine(dir, "graph_scan_bench.db");
+        _dbPath = BenchmarkTempDb.CreatePath("graph_scan");
+        GraphGenerator.GenerateSQLite(_dbPath, nodeCount: 5000, edgeCount: 15000);
+        _dbBytes = BenchmarkTempDb.ReadAllBytesWithRetry(_dbPath);
 
-        if (!File.Exists(_dbPath))
-            GraphGenerator.GenerateSQLite(_dbPath, nodeCount: 5000, edgeCount: 15000);
-        _dbBytes = File.ReadAllBytes(_dbPath);
-
-        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly;Pooling=False");
         _conn.Open();
 
         _sharcDb = SharcDatabase.OpenMemory(_dbBytes, new SharcOpenOptions { PageCacheSize = 0 });
+
+        // Prepared readers — resolve schema + cursor once
+        _preparedNodes = _sharcDb.PrepareReader("_concepts");
+        _preparedEdges = _sharcDb.PrepareReader("_relations");
+        _preparedEdgesProjected = _sharcDb.PrepareReader("_relations", "source_key", "kind", "target_key");
+        _preparedNodesProjection = _sharcDb.PrepareReader("_concepts", "id", "type_id");
+
+        // Prepared queries for filter benchmarks
+        _preparedEdgeFilterZeroAlloc = _sharcDb.Prepare(
+            "SELECT kind FROM _relations WHERE kind = 15");
+        _preparedEdgeFilterPushdown = _sharcDb.Prepare(
+            "SELECT source_key, kind, target_key FROM _relations WHERE kind = 15");
     }
 
     [IterationCleanup]
@@ -51,8 +73,15 @@ public class GraphScanBenchmarks
     [GlobalCleanup]
     public void Cleanup()
     {
+        _preparedNodes?.Dispose();
+        _preparedEdges?.Dispose();
+        _preparedEdgesProjected?.Dispose();
+        _preparedNodesProjection?.Dispose();
+        _preparedEdgeFilterZeroAlloc?.Dispose();
+        _preparedEdgeFilterPushdown?.Dispose();
         _conn?.Dispose();
         _sharcDb?.Dispose();
+        BenchmarkTempDb.TryDelete(_dbPath);
     }
 
     // --- Scan all nodes (concepts) ---
@@ -61,14 +90,14 @@ public class GraphScanBenchmarks
     [BenchmarkCategory("NodeScan")]
     public long Sharc_ScanAllNodes()
     {
-        using var reader = _sharcDb.CreateReader("_concepts");
+        using var reader = _preparedNodes.CreateReader();
         long count = 0;
         while (reader.Read())
         {
-            _ = reader.GetString(0);  // id
-            _ = reader.GetInt64(1);   // key
-            _ = reader.GetInt64(2);   // type_id
-            _ = reader.GetString(3);  // data
+            _ = reader.GetUtf8Span(0);  // id — UTF-8 span, no string alloc
+            _ = reader.GetInt64(1);     // key
+            _ = reader.GetInt64(2);     // type_id
+            _ = reader.GetUtf8Span(3);  // data — UTF-8 span, no string alloc
             count++;
         }
         return count;
@@ -99,14 +128,13 @@ public class GraphScanBenchmarks
     [BenchmarkCategory("EdgeScan")]
     public long Sharc_ScanAllEdges()
     {
-        using var reader = _sharcDb.CreateReader("_relations");
+        using var reader = _preparedEdgesProjected.CreateReader();
         long count = 0;
         while (reader.Read())
         {
-            _ = reader.GetString(0);  // id
-            _ = reader.GetInt64(1);   // source_key
-            _ = reader.GetInt64(2);   // kind
-            _ = reader.GetInt64(3);   // target_key
+            _ = reader.GetInt64(0);   // source_key
+            _ = reader.GetInt64(1);   // kind
+            _ = reader.GetInt64(2);   // target_key
             count++;
         }
         return count;
@@ -117,15 +145,14 @@ public class GraphScanBenchmarks
     public long SQLite_ScanAllEdges()
     {
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT id, source_key, kind, target_key FROM _relations";
+        cmd.CommandText = "SELECT source_key, kind, target_key FROM _relations";
         long count = 0;
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
         {
-            _ = reader.GetString(0);
+            _ = reader.GetInt64(0);
             _ = reader.GetInt64(1);
             _ = reader.GetInt64(2);
-            _ = reader.GetInt64(3);
             count++;
         }
         return count;
@@ -137,11 +164,11 @@ public class GraphScanBenchmarks
     [BenchmarkCategory("NodeProjection")]
     public long Sharc_ScanNodes_Projection()
     {
-        using var reader = _sharcDb.CreateReader("_concepts", "id", "type_id");
+        using var reader = _preparedNodesProjection.CreateReader();
         long count = 0;
         while (reader.Read())
         {
-            _ = reader.GetString(0);
+            _ = reader.GetUtf8Span(0);  // id — UTF-8 span, no string alloc
             _ = reader.GetInt64(1);
             count++;
         }
@@ -166,17 +193,12 @@ public class GraphScanBenchmarks
     }
 
     // --- Scan edges and count by kind (filter simulation) ---
-    
+
     [Benchmark]
     [BenchmarkCategory("EdgeFilter")]
     public long Sharc_ScanEdges_ZeroAlloc()
     {
-        var filters = new[]
-        {
-            new SharcFilter("kind", SharcOperator.Equal, (long)15),
-        };
-        // Using projection ("kind" only) ensures TEXT columns like "id" are never decoded/allocated.
-        using var reader = _sharcDb.CreateReader("_relations", ["kind"], filters);
+        using var reader = _preparedEdgeFilterZeroAlloc.Execute();
         long matchCount = 0;
         while (reader.Read())
         {
@@ -189,11 +211,7 @@ public class GraphScanBenchmarks
     [BenchmarkCategory("EdgeFilter")]
     public long Sharc_ScanEdges_PushdownKind()
     {
-        var filters = new[]
-        {
-            new SharcFilter("kind", SharcOperator.Equal, (long)15),
-        };
-        using var reader = _sharcDb.CreateReader("_relations", filters);
+        using var reader = _preparedEdgeFilterPushdown.Execute();
         long matchCount = 0;
         while (reader.Read())
         {
@@ -206,7 +224,7 @@ public class GraphScanBenchmarks
     [BenchmarkCategory("EdgeFilter")]
     public long Sharc_ScanEdges_CountByKind()
     {
-        using var reader = _sharcDb.CreateReader("_relations");
+        using var reader = _preparedEdges.CreateReader();
         long matchCount = 0;
         while (reader.Read())
         {

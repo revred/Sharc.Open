@@ -13,6 +13,10 @@ public sealed class ShadowPageSource : IWritablePageSource
     private readonly IPageSource _baseSource;
     private readonly Dictionary<uint, int> _dirtySlots = new(8);
     private PageArena? _arena;
+    // Updated atomically via CAS loop in UpdateMaxDirtyPage to prevent concurrent WritePage
+    // calls from regressing the max (e.g., Thread A writes page 100, Thread B writes page 99,
+    // non-atomic update could leave _maxDirtyPage=99 despite page 100 existing).
+    // Not volatile — all access goes through Interlocked or is single-threaded (Dispose/Reset).
     private uint _maxDirtyPage;
     private long _shadowVersion;
     private bool _disposed;
@@ -24,7 +28,8 @@ public sealed class ShadowPageSource : IWritablePageSource
     }
 
     /// <inheritdoc />
-    public long DataVersion => ((_baseSource as IWritablePageSource)?.DataVersion ?? 0) + Interlocked.Read(ref _shadowVersion);
+    public long DataVersion => ((_baseSource as IWritablePageSource)?.DataVersion ?? 0)
+        + (SharcRuntime.IsSingleThreaded ? _shadowVersion : Interlocked.Read(ref _shadowVersion));
 
     /// <inheritdoc />
     public int PageSize => _baseSource.PageSize;
@@ -36,7 +41,7 @@ public sealed class ShadowPageSource : IWritablePageSource
         {
             int baseCount = _baseSource.PageCount;
             if (_dirtySlots.Count == 0) return baseCount;
-            return Math.Max(baseCount, (int)_maxDirtyPage);
+            return Math.Max(baseCount, (int)(SharcRuntime.IsSingleThreaded ? _maxDirtyPage : Volatile.Read(ref _maxDirtyPage)));
         }
     }
 
@@ -93,8 +98,9 @@ public sealed class ShadowPageSource : IWritablePageSource
             _dirtySlots[pageNumber] = slot;
         }
         source.CopyTo(_arena.GetSlot(slot));
-        if (pageNumber > _maxDirtyPage) _maxDirtyPage = pageNumber;
-        Interlocked.Increment(ref _shadowVersion);
+        UpdateMaxDirtyPage(pageNumber);
+        if (SharcRuntime.IsSingleThreaded) _shadowVersion++;
+        else Interlocked.Increment(ref _shadowVersion);
     }
 
     /// <inheritdoc />
@@ -134,12 +140,30 @@ public sealed class ShadowPageSource : IWritablePageSource
         _disposed = false;
     }
 
+    /// <summary>Atomic max update using CAS loop to prevent regression from concurrent writes.</summary>
+    private void UpdateMaxDirtyPage(uint pageNumber)
+    {
+        if (SharcRuntime.IsSingleThreaded)
+        {
+            if (pageNumber > _maxDirtyPage) _maxDirtyPage = pageNumber;
+            return;
+        }
+        uint current = _maxDirtyPage;
+        while (pageNumber > current)
+        {
+            uint prev = Interlocked.CompareExchange(ref _maxDirtyPage, pageNumber, current);
+            if (prev == current) break; // CAS succeeded
+            current = prev; // retry with updated value
+        }
+    }
+
     private void ClearInternal()
     {
         _dirtySlots.Clear();
         _arena?.Reset();
         _maxDirtyPage = 0;
-        Interlocked.Exchange(ref _shadowVersion, 0);
+        if (SharcRuntime.IsSingleThreaded) _shadowVersion = 0;
+        else Interlocked.Exchange(ref _shadowVersion, 0);
     }
 
     /// <inheritdoc />

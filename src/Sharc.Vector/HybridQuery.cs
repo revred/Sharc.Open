@@ -1,8 +1,10 @@
 // Copyright (c) Ram Revanur. All rights reserved.
 // Licensed under the MIT License.
 
+using System.Runtime.CompilerServices;
 using Sharc.Core.Trust;
 using Sharc.Trust;
+using Sharc.Vector.Hnsw;
 
 namespace Sharc.Vector;
 
@@ -77,6 +79,34 @@ public sealed class HybridQuery : IDisposable
 
     private AgentInfo? _agent;
 
+    // ── HNSW Index ────────────────────────────────────────────────
+
+    private HnswIndex? _hnswIndex;
+
+    /// <summary>
+    /// Attaches an HNSW index for the vector leg of hybrid search.
+    /// When set and the dataset exceeds the small-N threshold, the vector
+    /// ranking phase uses ANN search instead of flat scan, then fuses with
+    /// text results via RRF as before.
+    /// </summary>
+    /// <param name="index">The HNSW index to use, or null to detach.</param>
+    public HybridQuery UseIndex(HnswIndex? index)
+    {
+        if (index != null)
+        {
+            if (index.Dimensions != _dimensions)
+                throw new ArgumentException(
+                    $"Index has {index.Dimensions} dimensions but HybridQuery expects {_dimensions}.",
+                    nameof(index));
+            if (index.Metric != _metric)
+                throw new ArgumentException(
+                    $"Index uses {index.Metric} but HybridQuery expects {_metric}.",
+                    nameof(index));
+        }
+        _hnswIndex = index;
+        return this;
+    }
+
     // ── Metadata Filtering (pre-search) ─────────────────────────
 
     /// <summary>
@@ -125,90 +155,97 @@ public sealed class HybridQuery : IDisposable
         byte[][] queryTermsUtf8 = TextScorer.TokenizeQuery(queryText);
         int poolSize = k * 3;
 
-        // ── Step 1: Vector scan ──────────────────────────────
+        // ── Step 1: Vector ranking (no metadata — deferred to post-fusion) ──
         var vectorRanks = new Dictionary<long, int>();
-        var metadataByRowId = new Dictionary<long, IReadOnlyDictionary<string, object?>?>();
 
+        bool useHnswForVector = _hnswIndex != null
+            && !_vectorJit.HasActiveFilters
+            && !_vectorJit.HasRowAccessEvaluator
+            && _hnswIndex.Count >= VectorQuery.SmallDatasetFlatScanThreshold;
+
+        if (useHnswForVector)
         {
-            string[] projection = new string[1 + columnNames.Length];
-            projection[0] = _vectorColumnName;
-            columnNames.CopyTo(projection, 1);
-
+            // HNSW fast path: ANN search for vector rankings
+            var hnswResult = _hnswIndex!.Search(queryVector, poolSize);
+            for (int i = 0; i < hnswResult.Count; i++)
+                vectorRanks[hnswResult[i].RowId] = i + 1;
+        }
+        else
+        {
+            // Flat scan path: project only the vector column (skip metadata decode)
             var heap = new VectorTopKHeap(poolSize, _metric != DistanceMetric.DotProduct);
 
-            using var reader = _vectorJit.Query(projection);
+            using var reader = _vectorJit.Query(_vectorColumnName);
             while (reader.Read())
             {
-                ReadOnlySpan<byte> blobBytes = reader.GetBlobSpan(0);
-                if (blobBytes.IsEmpty) continue; // skip NULL vector
+                if (!TryDecodeHybridVector(reader, out ReadOnlySpan<float> storedVector))
+                    continue;
 
-                ReadOnlySpan<float> storedVector = BlobVectorCodec.Decode(blobBytes);
                 float distance = _distanceFn(queryVector, storedVector);
 
                 if (heap.ShouldInsert(distance))
-                {
-                    IReadOnlyDictionary<string, object?>? metadata = null;
-                    if (columnNames.Length > 0)
-                        metadata = ExtractMetadata(reader, columnNames);
-                    heap.ForceInsert(reader.RowId, distance, metadata);
-                }
+                    heap.ForceInsert(reader.RowId, distance);
             }
 
             var vectorResult = heap.ToResult();
             for (int i = 0; i < vectorResult.Count; i++)
-            {
-                var match = vectorResult[i];
-                vectorRanks[match.RowId] = i + 1; // 1-based rank
-                metadataByRowId[match.RowId] = match.Metadata;
-            }
+                vectorRanks[vectorResult[i].RowId] = i + 1;
         }
 
-        // ── Step 2: Text scan ────────────────────────────────
+        // ── Step 2: Text ranking (no metadata — deferred to post-fusion) ──
         var textRanks = new Dictionary<long, int>();
 
         if (queryTermsUtf8.Length > 0)
         {
-            string[] textProjection = new string[1 + columnNames.Length];
-            textProjection[0] = _textColumnName;
-            columnNames.CopyTo(textProjection, 1);
-
             // Bounded heap: keep top poolSize text results without full-list materialization.
             // Min-heap by TF score: root = worst retained score, evict when new score is better.
             var heap = new TextTopKHeap(poolSize);
 
-            using var reader = _textJit.Query(textProjection);
+            using var reader = _textJit.Query(_textColumnName);
             while (reader.Read())
             {
                 ReadOnlySpan<byte> textBytes = reader.GetUtf8Span(0);
                 float tfScore = TextScorer.Score(textBytes, queryTermsUtf8);
 
                 if (tfScore > 0 && heap.ShouldInsert(tfScore))
-                {
-                    IReadOnlyDictionary<string, object?>? metadata = null;
-                    if (columnNames.Length > 0 && !metadataByRowId.ContainsKey(reader.RowId))
-                        metadata = ExtractMetadata(reader, columnNames);
-                    heap.ForceInsert(reader.RowId, tfScore, metadata);
-                }
+                    heap.ForceInsert(reader.RowId, tfScore, null);
             }
 
-            // Drain heap sorted by TF score descending (highest first)
             var topText = heap.ToSortedDescending();
             for (int i = 0; i < topText.Count; i++)
-            {
-                textRanks[topText[i].RowId] = i + 1; // 1-based rank
-                if (!metadataByRowId.ContainsKey(topText[i].RowId))
-                    metadataByRowId[topText[i].RowId] = topText[i].Metadata;
-            }
+                textRanks[topText[i].RowId] = i + 1;
         }
 
         // ── Step 3: Fuse ─────────────────────────────────────
         var fused = RankFusion.Fuse(vectorRanks, textRanks, k);
 
-        // ── Step 4: Build results ────────────────────────────
+        // ── Step 4: Materialize metadata only for final winners ──
+        Dictionary<long, IReadOnlyDictionary<string, object?>>? metadataLookup = null;
+        if (columnNames.Length > 0 && fused.Count > 0)
+        {
+            metadataLookup = new Dictionary<long, IReadOnlyDictionary<string, object?>>(fused.Count);
+            var table = _vectorJit.Table!;
+
+            using var seekReader = _db!.CreateReader(table.Name, columnNames);
+            for (int i = 0; i < fused.Count; i++)
+            {
+                long rowId = fused[i].RowId;
+                if (seekReader.Seek(rowId))
+                {
+                    var dict = new Dictionary<string, object?>(columnNames.Length, StringComparer.OrdinalIgnoreCase);
+                    for (int c = 0; c < columnNames.Length; c++)
+                        dict[columnNames[c]] = seekReader.GetValue(c);
+                    metadataLookup[rowId] = dict;
+                }
+            }
+        }
+
+        // ── Step 5: Build results ────────────────────────────
         var matches = new List<HybridMatch>(fused.Count);
         foreach (var (rowId, score, vr, tr) in fused)
         {
-            metadataByRowId.TryGetValue(rowId, out var metadata);
+            IReadOnlyDictionary<string, object?>? metadata = null;
+            metadataLookup?.TryGetValue(rowId, out metadata);
             matches.Add(new HybridMatch(
                 rowId,
                 score,
@@ -251,16 +288,34 @@ public sealed class HybridQuery : IDisposable
         EntitlementEnforcer.Enforce(_agent, _vectorJit.Table!.Name, allColumns);
     }
 
-    private static Dictionary<string, object?> ExtractMetadata(SharcDataReader reader, string[] columnNames)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryDecodeHybridVector(SharcDataReader reader, out ReadOnlySpan<float> vector)
     {
-        var dict = new Dictionary<string, object?>(columnNames.Length, StringComparer.OrdinalIgnoreCase);
-        // Metadata columns start at index 1 because index 0 is always the vector/text column.
-        for (int i = 0; i < columnNames.Length; i++)
+        ReadOnlySpan<byte> blob = reader.GetBlobSpan(0);
+        if (blob.IsEmpty)
         {
-            dict[columnNames[i]] = reader.GetValue(i + 1);
+            vector = default;
+            return false; // Preserve existing behavior: skip NULL/empty vectors.
         }
-        return dict;
+
+        if (!BlobVectorCodec.TryDecode(blob, out vector))
+            ThrowInvalidVectorPayload(reader.RowId, blob.Length);
+
+        if (vector.Length != _dimensions)
+            ThrowVectorDimensionMismatch(reader.RowId, vector.Length);
+
+        return true;
     }
+
+    private void ThrowInvalidVectorPayload(long rowId, int byteLength) =>
+        throw new InvalidOperationException(
+            $"Row {rowId} in table '{_vectorJit.Table!.Name}' has an invalid vector payload " +
+            $"length ({byteLength} bytes).");
+
+    private void ThrowVectorDimensionMismatch(long rowId, int foundDimensions) =>
+        throw new InvalidOperationException(
+            $"Row {rowId} in table '{_vectorJit.Table!.Name}' has {foundDimensions} dimensions " +
+            $"but this query expects {_dimensions}.");
 
     /// <summary>
     /// Fixed-capacity min-heap for top-K text scoring. Root = lowest (worst) retained

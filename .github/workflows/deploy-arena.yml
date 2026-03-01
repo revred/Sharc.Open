@@ -2,7 +2,7 @@ name: Deploy Sharc Arena
 
 on:
   push:
-    branches: [ main ]
+    branches: [ dev ]
   workflow_dispatch:
 
 permissions:
@@ -25,9 +25,9 @@ jobs:
       - name: Publish Sharc.Arena.Wasm
         run: dotnet publish src/Sharc.Arena.Wasm/Sharc.Arena.Wasm.csproj -c Release -o release --nologo
 
-      # GitHub Pages runs in a subdirectory (e.g. revred.github.io/Sharc/), so we must update base href
-      - name: Change base-tag in index.html from / to /Sharc/
-        run: sed -i 's|base href="/"|base href="/Sharc/"|g' release/wwwroot/index.html
+      # GitHub Pages runs in a subdirectory (e.g. revred.github.io/Sharc.Open/), so we must update base href
+      - name: Change base-tag in index.html from / to /Sharc.Open/
+        run: sed -i 's|base href="/"|base href="/Sharc.Open/"|g' release/wwwroot/index.html
       
       # Fix Blazor WASM on GitHub Pages (SPA routing 404 hack)
       - name: Copy index.html to 404.html

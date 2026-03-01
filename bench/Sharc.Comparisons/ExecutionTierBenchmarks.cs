@@ -22,6 +22,7 @@ namespace Sharc.Comparisons;
 [RankColumn]
 public class ExecutionTierBenchmarks
 {
+    private string _dbPath = null!;
     private byte[] _dbBytes = null!;
     private SharcDatabase _sharcDb = null!;
 
@@ -33,13 +34,9 @@ public class ExecutionTierBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        var dir = Path.Combine(Path.GetTempPath(), "sharc_roundtrip_bench");
-        Directory.CreateDirectory(dir);
-        var dbPath = Path.Combine(dir, "roundtrip_bench.db");
-
-        if (!File.Exists(dbPath))
-            RoundtripDataGenerator.Generate(dbPath, rowsPerTable: 2500, overlapStart: 2001);
-        _dbBytes = File.ReadAllBytes(dbPath);
+        _dbPath = BenchmarkTempDb.CreatePath("roundtrip_tiers");
+        RoundtripDataGenerator.Generate(_dbPath, rowsPerTable: 2500, overlapStart: 2001);
+        _dbBytes = BenchmarkTempDb.ReadAllBytesWithRetry(_dbPath);
 
         _sharcDb = SharcDatabase.OpenMemory(_dbBytes, new SharcOpenOptions { PageCacheSize = 100 });
 
@@ -57,6 +54,7 @@ public class ExecutionTierBenchmarks
         _preparedParam?.Dispose();
         _prepared?.Dispose();
         _sharcDb?.Dispose();
+        BenchmarkTempDb.TryDelete(_dbPath);
     }
 
     // ═══════════════════════════════════════════════════════════════
