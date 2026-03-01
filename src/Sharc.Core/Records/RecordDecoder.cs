@@ -470,12 +470,23 @@ internal sealed class RecordDecoder : IRecordDecoder, ISharcExtension
     [SuppressMessage("Performance", "CA1822:Mark members as static")]
     public void ComputeColumnOffsets(ReadOnlySpan<long> serialTypes, int columnCount, int bodyOffset, Span<int> offsets)
     {
-        int offset = bodyOffset;
-        for (int i = 0; i < columnCount; i++)
+        ComputeColumnOffsetsIncremental(serialTypes, 0, columnCount, bodyOffset, offsets);
+    }
+
+    /// <summary>
+    /// Computes column offsets incrementally, starting from a previously computed ordinal.
+    /// This allows lazy Readers to only compute offsets up to the requested column.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int ComputeColumnOffsetsIncremental(ReadOnlySpan<long> serialTypes, int startOrdinal, int endOrdinal, int startOffset, Span<int> offsets)
+    {
+        int offset = startOffset;
+        for (int i = startOrdinal; i < endOrdinal; i++)
         {
             offsets[i] = offset;
             offset += SerialTypeCodec.GetContentSize(serialTypes[i]);
         }
+        return offset;
     }
 
     /// <inheritdoc />

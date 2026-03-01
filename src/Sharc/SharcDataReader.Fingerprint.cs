@@ -30,28 +30,35 @@ public sealed partial class SharcDataReader
 
     private Fingerprint128 GetCursorRowFingerprint()
     {
-        var payload = _cursor!.Payload;
+        ReadOnlySpan<byte> payload;
+        long rowId;
+        if (_btreeCachedCursor != null) { payload = _btreeCachedCursor.Payload; rowId = _btreeCachedCursor.RowId; }
+        else if (_btreeMemoryCursor != null) { payload = _btreeMemoryCursor.Payload; rowId = _btreeMemoryCursor.RowId; }
+        else { payload = _cursor!.Payload; rowId = _cursor!.RowId; }
 
         if (_serialTypes != null && IsLazy && _columnOffsets != null)
         {
-            // Fast path: reuse precomputed offsets from DecodeCurrentRow() — zero recomputation
-            int colCount = Math.Min(_columnCount, _serialTypes.Length);
-            var serialTypes = _serialTypes.AsSpan(0, colCount);
-            var offsets = _columnOffsets.AsSpan(0, colCount);
+            // Ensure all offsets are computed before fingerprinting
+            int physCount = PhysicalColumnCount;
+            EnsureOffsetsComputed(physCount - 1);
 
-            if (TryComputeFixedWidthNumericFingerprint(payload, serialTypes, offsets, out var fastFingerprint))
+            // Fast path: reuse precomputed offsets from DecodeCurrentRow() — zero recomputation
+            var serialTypes = _serialTypes.AsSpan(0, physCount);
+            var offsets = _columnOffsets.AsSpan(0, physCount);
+
+            if (TryComputeFixedWidthNumericFingerprint(payload, rowId, serialTypes, offsets, out var fastFingerprint))
                 return fastFingerprint;
 
-            return ComputeFingerprint(payload, serialTypes, offsets);
+            return ComputeFingerprint(payload, rowId, serialTypes, offsets);
         }
 
         // Non-projection path: parse serial types on the fly (stackalloc — zero alloc)
         Span<long> stackSt = stackalloc long[Math.Min((int)_columnCount, 64)];
         _recordDecoder!.ReadSerialTypes(payload, stackSt, out int bodyOffset);
-        return ComputeFingerprint(payload, stackSt.Slice(0, Math.Min(_columnCount, stackSt.Length)), bodyOffset);
+        return ComputeFingerprint(payload, rowId, stackSt.Slice(0, Math.Min(_columnCount, stackSt.Length)), bodyOffset);
     }
 
-    private Fingerprint128 ComputeFingerprint(ReadOnlySpan<byte> payload, ReadOnlySpan<long> serialTypes, int bodyOffset)
+    private Fingerprint128 ComputeFingerprint(ReadOnlySpan<byte> payload, long rowId, ReadOnlySpan<long> serialTypes, int bodyOffset)
     {
         // Compute cumulative byte offsets for all physical columns (single pass)
         Span<int> offsets = stackalloc int[serialTypes.Length];
@@ -62,13 +69,13 @@ public sealed partial class SharcDataReader
             runningOffset += SerialTypeCodec.GetContentSize(serialTypes[c]);
         }
 
-        if (TryComputeFixedWidthNumericFingerprint(payload, serialTypes, offsets, out var fastFingerprint))
+        if (TryComputeFixedWidthNumericFingerprint(payload, rowId, serialTypes, offsets, out var fastFingerprint))
             return fastFingerprint;
 
-        return ComputeFingerprint(payload, serialTypes, offsets);
+        return ComputeFingerprint(payload, rowId, serialTypes, offsets);
     }
 
-    private Fingerprint128 ComputeFingerprint(ReadOnlySpan<byte> payload, ReadOnlySpan<long> serialTypes, ReadOnlySpan<int> offsets)
+    private Fingerprint128 ComputeFingerprint(ReadOnlySpan<byte> payload, long rowId, ReadOnlySpan<long> serialTypes, ReadOnlySpan<int> offsets)
     {
         // Hash projected columns
         var hasher = new Fnv1aHasher();
@@ -82,7 +89,7 @@ public sealed partial class SharcDataReader
             if (physOrdinal == _rowidAliasOrdinal)
             {
                 hasher.AddTypeTag(i, 1); // 1 = integer
-                hasher.AppendLong(_cursor!.RowId);
+                hasher.AppendLong(rowId);
                 continue;
             }
 
@@ -141,6 +148,7 @@ public sealed partial class SharcDataReader
 
     private bool TryComputeFixedWidthNumericFingerprint(
         ReadOnlySpan<byte> payload,
+        long rowId,
         ReadOnlySpan<long> serialTypes,
         ReadOnlySpan<int> offsets,
         out Fingerprint128 fingerprint)
@@ -155,7 +163,7 @@ public sealed partial class SharcDataReader
             if (physOrdinal == _rowidAliasOrdinal)
             {
                 hasher.AddTypeTag(i, 1);
-                hasher.AppendLong(_cursor!.RowId);
+                hasher.AppendLong(rowId);
                 continue;
             }
 
@@ -265,14 +273,25 @@ public sealed partial class SharcDataReader
 
         if (physOrdinal == _rowidAliasOrdinal)
         {
+            long rowId;
+            if (_btreeCachedCursor != null) rowId = _btreeCachedCursor.RowId;
+            else if (_btreeMemoryCursor != null) rowId = _btreeMemoryCursor.RowId;
+            else rowId = _cursor!.RowId;
+
             var h = new Fnv1aHasher();
             h.AddTypeTag(0, 1); // integer
-            h.AppendLong(_cursor!.RowId);
+            h.AppendLong(rowId);
             return h.Hash;
         }
 
-        var payload = _cursor!.Payload;
+        ReadOnlySpan<byte> payload;
+        if (_btreeCachedCursor != null) payload = _btreeCachedCursor.Payload;
+        else if (_btreeMemoryCursor != null) payload = _btreeMemoryCursor.Payload;
+        else payload = _cursor!.Payload;
+
         var stSpan = IsLazy ? _serialTypes! : _filter!.FilterSerialTypes!;
+
+        if (IsLazy) EnsureOffsetsComputed(physOrdinal);
 
         // Use precomputed O(1) offset
         int offset = _columnOffsets![physOrdinal];
