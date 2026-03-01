@@ -122,7 +122,7 @@ public sealed class PreparedQuery : IPreparedReader
     /// <exception cref="ObjectDisposedException">The prepared query has been disposed.</exception>
     public SharcDataReader Execute(IReadOnlyDictionary<string, object>? parameters)
     {
-        _guard.EnterReadLock();
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterReadLock();
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -202,7 +202,7 @@ public sealed class PreparedQuery : IPreparedReader
         }
         finally
         {
-            _guard.ExitReadLock();
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitReadLock();
         }
     }
 
@@ -212,7 +212,7 @@ public sealed class PreparedQuery : IPreparedReader
         if (_disposed) return;
 
         // Write lock: waits for all active Execute calls to finish before cleanup.
-        _guard.EnterWriteLock();
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterWriteLock();
         try
         {
             if (_disposed) return;
@@ -226,10 +226,10 @@ public sealed class PreparedQuery : IPreparedReader
         }
         finally
         {
-            _guard.ExitWriteLock();
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitWriteLock();
         }
 
-        _guard.Dispose();
+        if (!SharcRuntime.IsSingleThreaded) _guard.Dispose();
     }
 
     private static long ComputeParamCacheKey(IReadOnlyDictionary<string, object>? parameters)

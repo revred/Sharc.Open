@@ -28,7 +28,8 @@ public sealed class ShadowPageSource : IWritablePageSource
     }
 
     /// <inheritdoc />
-    public long DataVersion => ((_baseSource as IWritablePageSource)?.DataVersion ?? 0) + Interlocked.Read(ref _shadowVersion);
+    public long DataVersion => ((_baseSource as IWritablePageSource)?.DataVersion ?? 0)
+        + (SharcRuntime.IsSingleThreaded ? _shadowVersion : Interlocked.Read(ref _shadowVersion));
 
     /// <inheritdoc />
     public int PageSize => _baseSource.PageSize;
@@ -40,7 +41,7 @@ public sealed class ShadowPageSource : IWritablePageSource
         {
             int baseCount = _baseSource.PageCount;
             if (_dirtySlots.Count == 0) return baseCount;
-            return Math.Max(baseCount, (int)Volatile.Read(ref _maxDirtyPage));
+            return Math.Max(baseCount, (int)(SharcRuntime.IsSingleThreaded ? _maxDirtyPage : Volatile.Read(ref _maxDirtyPage)));
         }
     }
 
@@ -98,7 +99,8 @@ public sealed class ShadowPageSource : IWritablePageSource
         }
         source.CopyTo(_arena.GetSlot(slot));
         UpdateMaxDirtyPage(pageNumber);
-        Interlocked.Increment(ref _shadowVersion);
+        if (SharcRuntime.IsSingleThreaded) _shadowVersion++;
+        else Interlocked.Increment(ref _shadowVersion);
     }
 
     /// <inheritdoc />
@@ -141,6 +143,11 @@ public sealed class ShadowPageSource : IWritablePageSource
     /// <summary>Atomic max update using CAS loop to prevent regression from concurrent writes.</summary>
     private void UpdateMaxDirtyPage(uint pageNumber)
     {
+        if (SharcRuntime.IsSingleThreaded)
+        {
+            if (pageNumber > _maxDirtyPage) _maxDirtyPage = pageNumber;
+            return;
+        }
         uint current = _maxDirtyPage;
         while (pageNumber > current)
         {
@@ -155,7 +162,8 @@ public sealed class ShadowPageSource : IWritablePageSource
         _dirtySlots.Clear();
         _arena?.Reset();
         _maxDirtyPage = 0;
-        Interlocked.Exchange(ref _shadowVersion, 0);
+        if (SharcRuntime.IsSingleThreaded) _shadowVersion = 0;
+        else Interlocked.Exchange(ref _shadowVersion, 0);
     }
 
     /// <inheritdoc />

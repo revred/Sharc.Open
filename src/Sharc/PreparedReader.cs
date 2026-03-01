@@ -73,7 +73,7 @@ public sealed class PreparedReader : IPreparedReader
     /// <exception cref="ObjectDisposedException">The prepared reader has been disposed.</exception>
     public SharcDataReader CreateReader()
     {
-        _guard.EnterReadLock();
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterReadLock();
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -93,7 +93,7 @@ public sealed class PreparedReader : IPreparedReader
         }
         finally
         {
-            _guard.ExitReadLock();
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitReadLock();
         }
     }
 
@@ -103,7 +103,7 @@ public sealed class PreparedReader : IPreparedReader
         if (_disposed) return;
 
         // Write lock: waits for all active CreateReader calls to finish before cleanup.
-        _guard.EnterWriteLock();
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterWriteLock();
         try
         {
             if (_disposed) return;
@@ -117,9 +117,9 @@ public sealed class PreparedReader : IPreparedReader
         }
         finally
         {
-            _guard.ExitWriteLock();
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitWriteLock();
         }
 
-        _guard.Dispose();
+        if (!SharcRuntime.IsSingleThreaded) _guard.Dispose();
     }
 }

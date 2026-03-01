@@ -80,10 +80,10 @@ public sealed class CachedPageSource : IWritablePageSource
     private int _cacheMissCount;
 
     /// <summary>Number of cache hits since creation.</summary>
-    public int CacheHitCount => Volatile.Read(ref _cacheHitCount);
+    public int CacheHitCount => SharcRuntime.IsSingleThreaded ? _cacheHitCount : Volatile.Read(ref _cacheHitCount);
 
     /// <summary>Number of cache misses since creation.</summary>
-    public int CacheMissCount => Volatile.Read(ref _cacheMissCount);
+    public int CacheMissCount => SharcRuntime.IsSingleThreaded ? _cacheMissCount : Volatile.Read(ref _cacheMissCount);
 
     /// <summary>Number of slots that have had a buffer rented (demand-driven). For test observability.</summary>
     internal int AllocatedSlotCount { get; private set; }
@@ -156,36 +156,39 @@ public sealed class CachedPageSource : IWritablePageSource
         // readers don't conflict with each other.
         // Dispose check is inside the lock to prevent TOCTOU: without it, Dispose() could
         // return buffers to ArrayPool between the check and the Span construction.
-        _rwLock.EnterReadLock();
+        if (!SharcRuntime.IsSingleThreaded) _rwLock.EnterReadLock();
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_lookup.TryGetValue(pageNumber, out int slotIndex))
             {
                 Volatile.Write(ref _refBits[slotIndex], 1); // earn eviction protection
-                Interlocked.Increment(ref _cacheHitCount);
+                if (SharcRuntime.IsSingleThreaded) _cacheHitCount++;
+                else Interlocked.Increment(ref _cacheHitCount);
                 return _slots[slotIndex].Data.AsSpan(0, PageSize);
             }
         }
         finally
         {
-            _rwLock.ExitReadLock();
+            if (!SharcRuntime.IsSingleThreaded) _rwLock.ExitReadLock();
         }
 
         // --- Write lock: miss path (exclusive — no concurrent reads or writes) ---
-        _rwLock.EnterWriteLock();
+        if (!SharcRuntime.IsSingleThreaded) _rwLock.EnterWriteLock();
         try
         {
             // Double-check: another thread may have loaded this page while we waited.
             if (_lookup.TryGetValue(pageNumber, out int slotIndex))
             {
                 Volatile.Write(ref _refBits[slotIndex], 1);
-                Interlocked.Increment(ref _cacheHitCount);
+                if (SharcRuntime.IsSingleThreaded) _cacheHitCount++;
+                else Interlocked.Increment(ref _cacheHitCount);
                 UpdateSequentialTracking(pageNumber);
                 return _slots[slotIndex].Data.AsSpan(0, PageSize);
             }
 
-            Interlocked.Increment(ref _cacheMissCount);
+            if (SharcRuntime.IsSingleThreaded) _cacheMissCount++;
+            else Interlocked.Increment(ref _cacheMissCount);
             int slot = AllocateSlot();
 
             _inner.ReadPage(pageNumber, _slots[slot].Data);
@@ -205,7 +208,7 @@ public sealed class CachedPageSource : IWritablePageSource
         }
         finally
         {
-            _rwLock.ExitWriteLock();
+            if (!SharcRuntime.IsSingleThreaded) _rwLock.ExitWriteLock();
         }
     }
 
@@ -223,36 +226,39 @@ public sealed class CachedPageSource : IWritablePageSource
         }
 
         // Read lock: concurrent hit path (see GetPage for detailed explanation)
-        _rwLock.EnterReadLock();
+        if (!SharcRuntime.IsSingleThreaded) _rwLock.EnterReadLock();
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_lookup.TryGetValue(pageNumber, out int slotIndex))
             {
                 Volatile.Write(ref _refBits[slotIndex], 1);
-                Interlocked.Increment(ref _cacheHitCount);
+                if (SharcRuntime.IsSingleThreaded) _cacheHitCount++;
+                else Interlocked.Increment(ref _cacheHitCount);
                 return _slots[slotIndex].Data.AsMemory(0, PageSize);
             }
         }
         finally
         {
-            _rwLock.ExitReadLock();
+            if (!SharcRuntime.IsSingleThreaded) _rwLock.ExitReadLock();
         }
 
         // Write lock: miss path
-        _rwLock.EnterWriteLock();
+        if (!SharcRuntime.IsSingleThreaded) _rwLock.EnterWriteLock();
         try
         {
             // Double-check after acquiring write lock
             if (_lookup.TryGetValue(pageNumber, out int slotIndex))
             {
                 Volatile.Write(ref _refBits[slotIndex], 1);
-                Interlocked.Increment(ref _cacheHitCount);
+                if (SharcRuntime.IsSingleThreaded) _cacheHitCount++;
+                else Interlocked.Increment(ref _cacheHitCount);
                 UpdateSequentialTracking(pageNumber);
                 return _slots[slotIndex].Data.AsMemory(0, PageSize);
             }
 
-            Interlocked.Increment(ref _cacheMissCount);
+            if (SharcRuntime.IsSingleThreaded) _cacheMissCount++;
+            else Interlocked.Increment(ref _cacheMissCount);
             slotIndex = AllocateSlot();
             _inner.ReadPage(pageNumber, _slots[slotIndex].Data);
             _slots[slotIndex].PageNumber = pageNumber;
@@ -266,7 +272,7 @@ public sealed class CachedPageSource : IWritablePageSource
         }
         finally
         {
-            _rwLock.ExitWriteLock();
+            if (!SharcRuntime.IsSingleThreaded) _rwLock.ExitWriteLock();
         }
     }
 
@@ -282,7 +288,7 @@ public sealed class CachedPageSource : IWritablePageSource
     {
         // Write lock: exclusive — waits for all readers to exit before proceeding.
         // This guarantees no reader is holding a Span over a slot we're about to return to ArrayPool.
-        _rwLock.EnterWriteLock();
+        if (!SharcRuntime.IsSingleThreaded) _rwLock.EnterWriteLock();
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -306,7 +312,7 @@ public sealed class CachedPageSource : IWritablePageSource
         }
         finally
         {
-            _rwLock.ExitWriteLock();
+            if (!SharcRuntime.IsSingleThreaded) _rwLock.ExitWriteLock();
         }
     }
 
@@ -314,7 +320,7 @@ public sealed class CachedPageSource : IWritablePageSource
     public void WritePage(uint pageNumber, ReadOnlySpan<byte> source)
     {
         // Write lock: exclusive — prevents readers from seeing a partially-written page.
-        _rwLock.EnterWriteLock();
+        if (!SharcRuntime.IsSingleThreaded) _rwLock.EnterWriteLock();
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -340,7 +346,7 @@ public sealed class CachedPageSource : IWritablePageSource
         }
         finally
         {
-            _rwLock.ExitWriteLock();
+            if (!SharcRuntime.IsSingleThreaded) _rwLock.ExitWriteLock();
         }
     }
 
@@ -360,7 +366,7 @@ public sealed class CachedPageSource : IWritablePageSource
         // Without this, a concurrent reader could hold a Span over a buffer we're about to return.
         if (_capacity > 0)
         {
-            _rwLock.EnterWriteLock();
+            if (!SharcRuntime.IsSingleThreaded) _rwLock.EnterWriteLock();
             try
             {
                 _disposed = true;
@@ -375,7 +381,7 @@ public sealed class CachedPageSource : IWritablePageSource
             }
             finally
             {
-                _rwLock.ExitWriteLock();
+                if (!SharcRuntime.IsSingleThreaded) _rwLock.ExitWriteLock();
             }
         }
         else
@@ -384,7 +390,7 @@ public sealed class CachedPageSource : IWritablePageSource
         }
 
         _inner.Dispose();
-        _rwLock.Dispose();
+        if (!SharcRuntime.IsSingleThreaded) _rwLock.Dispose();
     }
 
     // --- CLOCK Eviction ---
@@ -489,7 +495,8 @@ public sealed class CachedPageSource : IWritablePageSource
             if (_lookup.ContainsKey(prefetchPage))
                 continue;
 
-            Interlocked.Increment(ref _cacheMissCount);
+            if (SharcRuntime.IsSingleThreaded) _cacheMissCount++;
+            else Interlocked.Increment(ref _cacheMissCount);
             int slot = AllocateSlot();
 
             _inner.ReadPage(prefetchPage, _slots[slot].Data);

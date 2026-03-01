@@ -60,7 +60,7 @@ public sealed class PreparedWriter : IPreparedWriter
     /// <inheritdoc/>
     public long Insert(params ColumnValue[] values)
     {
-        _guard.EnterReadLock();
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterReadLock();
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -75,14 +75,14 @@ public sealed class PreparedWriter : IPreparedWriter
         }
         finally
         {
-            _guard.ExitReadLock();
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitReadLock();
         }
     }
 
     /// <inheritdoc/>
     public bool Delete(long rowId)
     {
-        _guard.EnterReadLock();
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterReadLock();
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -97,14 +97,14 @@ public sealed class PreparedWriter : IPreparedWriter
         }
         finally
         {
-            _guard.ExitReadLock();
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitReadLock();
         }
     }
 
     /// <inheritdoc/>
     public bool Update(long rowId, params ColumnValue[] values)
     {
-        _guard.EnterReadLock();
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterReadLock();
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -119,7 +119,7 @@ public sealed class PreparedWriter : IPreparedWriter
         }
         finally
         {
-            _guard.ExitReadLock();
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitReadLock();
         }
     }
 
@@ -144,7 +144,7 @@ public sealed class PreparedWriter : IPreparedWriter
         if (_disposed) return;
 
         // Write lock: waits for all active mutations to finish before cleanup.
-        _guard.EnterWriteLock();
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterWriteLock();
         try
         {
             if (_disposed) return;
@@ -158,9 +158,9 @@ public sealed class PreparedWriter : IPreparedWriter
         }
         finally
         {
-            _guard.ExitWriteLock();
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitWriteLock();
         }
 
-        _guard.Dispose();
+        if (!SharcRuntime.IsSingleThreaded) _guard.Dispose();
     }
 }
