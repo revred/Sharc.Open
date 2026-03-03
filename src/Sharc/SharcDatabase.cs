@@ -161,6 +161,38 @@ public sealed class SharcDatabase : IDisposable
         }
     }
 
+    /// <summary>
+    /// Performs Step 1 of folding: Reorders records for maximum B-tree locality.
+    /// Requires agent entitlement.
+    /// </summary>
+    public void FoldFast(string agentId, string tableName, string[] sortColumns)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var service = new Storage.SharcFoldService(this);
+        service.FoldFast(agentId, tableName, sortColumns);
+    }
+
+    /// <summary>
+    /// Performs Step 2 of folding: PCodec bitwise compression.
+    /// Requires agent entitlement.
+    /// </summary>
+    public void FoldMax(string agentId, string tableName)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var service = new Storage.SharcFoldService(this);
+        service.FoldMax(agentId, tableName);
+    }
+
+    /// <summary>
+    /// Reverts a table to its unfolded state.
+    /// Requires agent entitlement.
+    /// </summary>
+    public void Unfold(string agentId, string tableName)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var service = new Storage.SharcFoldService(this);
+        service.Unfold(agentId, tableName);
+    }
 
     internal SharcDatabase(ProxyPageSource proxySource, IPageSource rawSource, DatabaseHeader header,
         IBTreeReader bTreeReader, IRecordDecoder recordDecoder,
