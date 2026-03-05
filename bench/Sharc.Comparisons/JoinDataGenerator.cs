@@ -17,7 +17,7 @@ public static class JoinDataGenerator
     {
         if (File.Exists(dbPath)) File.Delete(dbPath);
 
-        using var conn = new SqliteConnection($"Data Source={dbPath}");
+        using var conn = new SqliteConnection($"Data Source={dbPath};Pooling=False");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -98,7 +98,7 @@ public static class JoinDataGenerator
     {
         if (File.Exists(dbPath)) File.Delete(dbPath);
 
-        using var conn = new SqliteConnection($"Data Source={dbPath}");
+        using var conn = new SqliteConnection($"Data Source={dbPath};Pooling=False");
         conn.Open();
 
         using var cmd = conn.CreateCommand();

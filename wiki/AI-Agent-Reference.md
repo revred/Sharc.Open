@@ -297,10 +297,11 @@ using Sharc.Views;
 using var db = SharcDatabase.Open("mydata.db");
 
 var view = ViewBuilder
-    .FromTable("users")
-    .WithProjection("id", "name")
-    .WithFilter(row => row.GetInt64(0) > 18)
-    .Build("adults");
+    .From("users")
+    .Select("id", "name")
+    .Where(row => row.GetInt64(0) > 18)
+    .Named("adults")
+    .Build();
 
 db.RegisterView(view);
 

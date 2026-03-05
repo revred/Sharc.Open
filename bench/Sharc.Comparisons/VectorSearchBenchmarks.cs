@@ -47,18 +47,22 @@ public class VectorSearchBenchmarks
     private byte[] _sqliteBlobBuf = null!;
     private float[] _sqliteFloatBuf = null!;
 
+    // ── Prepared VectorQuery handles (zero per-call schema resolution) ──
+    private VectorQuery _vqCosine = null!;
+    private VectorQuery _vqCosineHnsw = null!;
+    private VectorQuery _vqCosineFilter = null!;
+    private VectorQuery _vqCosineHnswFilter = null!;
+    private VectorQuery _vqEuclidean = null!;
+    private VectorQuery _vqDotProduct = null!;
+
     [GlobalSetup]
     public void Setup()
     {
-        var dir = Path.Combine(Path.GetTempPath(), "sharc_vec_bench");
-        Directory.CreateDirectory(dir);
-        _dbPath = Path.Combine(dir, "vec_bench.db");
+        _dbPath = BenchmarkTempDb.CreatePath("vector");
+        VectorDataGenerator.GenerateSQLite(_dbPath, RowCount, Dimensions);
+        _dbBytes = BenchmarkTempDb.ReadAllBytesWithRetry(_dbPath);
 
-        if (!File.Exists(_dbPath))
-            VectorDataGenerator.GenerateSQLite(_dbPath, RowCount, Dimensions);
-        _dbBytes = File.ReadAllBytes(_dbPath);
-
-        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly;Pooling=False");
         _conn.Open();
 
         _sharcDb = SharcDatabase.OpenMemory(_dbBytes, new SharcOpenOptions { PageCacheSize = 100 });
@@ -72,14 +76,33 @@ public class VectorSearchBenchmarks
 
         _sqliteBlobBuf = new byte[Dimensions * sizeof(float)];
         _sqliteFloatBuf = new float[Dimensions];
+
+        // Pre-compiled VectorQuery handles — schema + distance resolved once
+        _vqCosine = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Cosine);
+        _vqCosineHnsw = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Cosine);
+        _vqCosineHnsw.UseIndex(_hnswIndex);
+        _vqCosineFilter = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Cosine);
+        _vqCosineFilter.Where(FilterStar.Column("category").Eq("science"));
+        _vqCosineHnswFilter = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Cosine);
+        _vqCosineHnswFilter.UseIndex(_hnswIndex);
+        _vqCosineHnswFilter.Where(FilterStar.Column("category").Eq("science"));
+        _vqEuclidean = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Euclidean);
+        _vqDotProduct = _sharcDb.Vector("vectors", "embedding", DistanceMetric.DotProduct);
     }
 
     [GlobalCleanup]
     public void Cleanup()
     {
+        _vqCosine?.Dispose();
+        _vqCosineHnsw?.Dispose();
+        _vqCosineFilter?.Dispose();
+        _vqCosineHnswFilter?.Dispose();
+        _vqEuclidean?.Dispose();
+        _vqDotProduct?.Dispose();
         _conn?.Dispose();
         _hnswIndex?.Dispose();
         _sharcDb?.Dispose();
+        BenchmarkTempDb.TryDelete(_dbPath);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -91,8 +114,7 @@ public class VectorSearchBenchmarks
     [BenchmarkCategory("VectorScan")]
     public float Sharc_VectorScan()
     {
-        using var vq = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Cosine);
-        var results = vq.NearestTo(_queryVector, k: RowCount);
+        var results = _vqCosine.NearestTo(_queryVector, k: RowCount);
         return results[0].Distance;
     }
 
@@ -127,8 +149,7 @@ public class VectorSearchBenchmarks
     [BenchmarkCategory("NearestNeighbor")]
     public int Sharc_NearestTo_Top10()
     {
-        using var vq = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Cosine);
-        var results = vq.NearestTo(_queryVector, k: 10);
+        var results = _vqCosine.NearestTo(_queryVector, k: 10);
         return results.Count;
     }
 
@@ -137,9 +158,7 @@ public class VectorSearchBenchmarks
     [BenchmarkCategory("Hnsw")]
     public int Sharc_Hnsw_NearestTo_Top10()
     {
-        using var vq = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Cosine);
-        vq.UseIndex(_hnswIndex);
-        var results = vq.NearestTo(_queryVector, k: 10);
+        var results = _vqCosineHnsw.NearestTo(_queryVector, k: 10);
         return results.Count;
     }
 
@@ -182,9 +201,7 @@ public class VectorSearchBenchmarks
     [BenchmarkCategory("FilteredVector")]
     public int Sharc_FilteredVector_Top10()
     {
-        using var vq = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Cosine);
-        vq.Where(FilterStar.Column("category").Eq("science"));
-        var results = vq.NearestTo(_queryVector, k: 10);
+        var results = _vqCosineFilter.NearestTo(_queryVector, k: 10);
         return results.Count;
     }
 
@@ -193,10 +210,7 @@ public class VectorSearchBenchmarks
     [BenchmarkCategory("Hnsw")]
     public int Sharc_Hnsw_FilterAware_Top10()
     {
-        using var vq = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Cosine);
-        vq.UseIndex(_hnswIndex);
-        vq.Where(FilterStar.Column("category").Eq("science"));
-        var results = vq.NearestTo(_queryVector, k: 10);
+        var results = _vqCosineHnswFilter.NearestTo(_queryVector, k: 10);
         return results.Count;
     }
 
@@ -205,11 +219,8 @@ public class VectorSearchBenchmarks
     [BenchmarkCategory("Planner")]
     public int Sharc_Hnsw_FilterAware_Strategy()
     {
-        using var vq = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Cosine);
-        vq.UseIndex(_hnswIndex);
-        vq.Where(FilterStar.Column("category").Eq("science"));
-        _ = vq.NearestTo(_queryVector, k: 10);
-        return (int)vq.LastExecutionInfo.Strategy;
+        _ = _vqCosineHnswFilter.NearestTo(_queryVector, k: 10);
+        return (int)_vqCosineHnswFilter.LastExecutionInfo.Strategy;
     }
 
     [Benchmark]
@@ -248,8 +259,7 @@ public class VectorSearchBenchmarks
     [BenchmarkCategory("DistanceMetric")]
     public float Sharc_Cosine_Top10()
     {
-        using var vq = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Cosine);
-        var results = vq.NearestTo(_queryVector, k: 10);
+        var results = _vqCosine.NearestTo(_queryVector, k: 10);
         return results[0].Distance;
     }
 
@@ -257,8 +267,7 @@ public class VectorSearchBenchmarks
     [BenchmarkCategory("DistanceMetric")]
     public float Sharc_Euclidean_Top10()
     {
-        using var vq = _sharcDb.Vector("vectors", "embedding", DistanceMetric.Euclidean);
-        var results = vq.NearestTo(_queryVector, k: 10);
+        var results = _vqEuclidean.NearestTo(_queryVector, k: 10);
         return results[0].Distance;
     }
 
@@ -266,8 +275,7 @@ public class VectorSearchBenchmarks
     [BenchmarkCategory("DistanceMetric")]
     public float Sharc_DotProduct_Top10()
     {
-        using var vq = _sharcDb.Vector("vectors", "embedding", DistanceMetric.DotProduct);
-        var results = vq.NearestTo(_queryVector, k: 10);
+        var results = _vqDotProduct.NearestTo(_queryVector, k: 10);
         return results[0].Distance;
     }
 }

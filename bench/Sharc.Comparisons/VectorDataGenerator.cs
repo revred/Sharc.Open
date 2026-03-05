@@ -30,7 +30,7 @@ public static class VectorDataGenerator
     {
         if (File.Exists(dbPath)) File.Delete(dbPath);
 
-        using var conn = new SqliteConnection($"Data Source={dbPath}");
+        using var conn = new SqliteConnection($"Data Source={dbPath};Pooling=False");
         conn.Open();
 
         using var schemaCmd = conn.CreateCommand();

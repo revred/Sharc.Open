@@ -18,6 +18,8 @@ namespace Sharc;
 /// <see cref="SharcWriter"/> pooling pattern.</para>
 /// <para>Thread-safe: each thread gets its own <see cref="ShadowPageSource"/> cache via
 /// <see cref="ThreadLocal{T}"/>. A single instance can be shared across N threads.</para>
+/// <para>Dispose is safe to call concurrently with mutations: Dispose acquires an exclusive
+/// write lock and waits for all active operations to finish before cleaning up.</para>
 /// </remarks>
 public sealed class PreparedWriter : IPreparedWriter
 {
@@ -29,6 +31,10 @@ public sealed class PreparedWriter : IPreparedWriter
 
     // Per-thread cached ShadowPageSource
     private readonly ThreadLocal<WriterSlot> _slot;
+
+    // Protects _slot access against concurrent Dispose.
+    // Mutations: read lock (concurrent from different threads). Dispose: write lock (exclusive).
+    private readonly ReaderWriterLockSlim _guard = new(LockRecursionPolicy.NoRecursion);
 
     private sealed class WriterSlot : IDisposable
     {
@@ -54,43 +60,67 @@ public sealed class PreparedWriter : IPreparedWriter
     /// <inheritdoc/>
     public long Insert(params ColumnValue[] values)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterReadLock();
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
 
-        var db = _db;
-        var slot = GetSlot();
-        using var tx = BeginAutoCommitTransaction(db, slot);
-        long rowId = SharcWriter.InsertCore(tx, _tableName, values, _tableInfo, _rootCache);
-        CapturePooledShadow(tx, slot);
-        tx.Commit();
-        return rowId;
+            var db = _db;
+            var slot = GetSlot();
+            using var tx = BeginAutoCommitTransaction(db, slot);
+            long rowId = SharcWriter.InsertCore(tx, _tableName, values, _tableInfo, _rootCache);
+            CapturePooledShadow(tx, slot);
+            tx.Commit();
+            return rowId;
+        }
+        finally
+        {
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitReadLock();
+        }
     }
 
     /// <inheritdoc/>
     public bool Delete(long rowId)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterReadLock();
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
 
-        var db = _db;
-        var slot = GetSlot();
-        using var tx = BeginAutoCommitTransaction(db, slot);
-        bool found = SharcWriter.DeleteCore(tx, _tableName, rowId, _rootCache);
-        CapturePooledShadow(tx, slot);
-        tx.Commit();
-        return found;
+            var db = _db;
+            var slot = GetSlot();
+            using var tx = BeginAutoCommitTransaction(db, slot);
+            bool found = SharcWriter.DeleteCore(tx, _tableName, rowId, _rootCache);
+            CapturePooledShadow(tx, slot);
+            tx.Commit();
+            return found;
+        }
+        finally
+        {
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitReadLock();
+        }
     }
 
     /// <inheritdoc/>
     public bool Update(long rowId, params ColumnValue[] values)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterReadLock();
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
 
-        var db = _db;
-        var slot = GetSlot();
-        using var tx = BeginAutoCommitTransaction(db, slot);
-        bool found = SharcWriter.UpdateCore(tx, _tableName, rowId, values, _tableInfo, _rootCache);
-        CapturePooledShadow(tx, slot);
-        tx.Commit();
-        return found;
+            var db = _db;
+            var slot = GetSlot();
+            using var tx = BeginAutoCommitTransaction(db, slot);
+            bool found = SharcWriter.UpdateCore(tx, _tableName, rowId, values, _tableInfo, _rootCache);
+            CapturePooledShadow(tx, slot);
+            tx.Commit();
+            return found;
+        }
+        finally
+        {
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitReadLock();
+        }
     }
 
     private WriterSlot GetSlot() => _slot.Value ??= new WriterSlot();
@@ -112,12 +142,25 @@ public sealed class PreparedWriter : IPreparedWriter
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
 
-        // Clean up all per-thread slots
-        foreach (var slot in _slot.Values)
-            slot.Dispose();
+        // Write lock: waits for all active mutations to finish before cleanup.
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterWriteLock();
+        try
+        {
+            if (_disposed) return;
+            _disposed = true;
 
-        _slot.Dispose();
+            // Clean up all per-thread slots
+            foreach (var slot in _slot.Values)
+                slot.Dispose();
+
+            _slot.Dispose();
+        }
+        finally
+        {
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitWriteLock();
+        }
+
+        if (!SharcRuntime.IsSingleThreaded) _guard.Dispose();
     }
 }

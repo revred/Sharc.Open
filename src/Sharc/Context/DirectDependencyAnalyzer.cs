@@ -38,22 +38,27 @@ public sealed class DirectDependencyAnalyzer : IImpactAnalyzer
                 var target = reader.GetString(1);
                 if (string.Equals(target, targetPath, StringComparison.OrdinalIgnoreCase))
                 {
-                    directDeps.Add(new ImpactedFile
-                    {
-                        Path = reader.GetString(0) ?? "",
-                        HopDistance = 1,
-                        TestCoverage = 0.0 // naive: no coverage data
-                    });
+                    directDeps.Add(new ImpactedFile(
+                        Path: reader.GetString(0) ?? "",
+                        Depth: 1,
+                        Coverage: 0.0,
+                        RuntimeFrequency: 0.0,
+                        ArchitectureRisk: 0.0,
+                        CompositeScore: 0.0,
+                        Reason: "direct dependency"));
                 }
             }
         }
 
-        return new ImpactReport
-        {
-            DirectDependencies = directDeps,
-            TransitiveDependencies = [], // naive: no multi-hop
-            RiskScore = directDeps.Count > 10 ? 0.8 : directDeps.Count > 3 ? 0.4 : 0.1,
-            SuggestedTestDepth = directDeps.Count > 10 ? "e2e" : directDeps.Count > 3 ? "integration" : "unit"
-        };
+        double riskScore = directDeps.Count > 10 ? 0.8 : directDeps.Count > 3 ? 0.4 : 0.1;
+        string safetyEnvelope = directDeps.Count > 10 ? "e2e" : directDeps.Count > 3 ? "integration" : "unit";
+
+        return new ImpactReport(
+            TargetPath: targetPath,
+            MaxDepth: options?.MaxDepth ?? 1,
+            Files: directDeps,
+            AggregateRiskScore: riskScore,
+            SafetyEnvelope: safetyEnvelope,
+            GeneratedAtUtc: DateTimeOffset.UtcNow);
     }
 }

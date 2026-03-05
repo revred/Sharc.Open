@@ -3,6 +3,8 @@
 
 
 using Sharc.Core;
+using Sharc.Core.BTree;
+using Sharc.Core.IO;
 using Sharc.Core.Records;
 using Sharc.Graph.Model;
 using Sharc.Graph.Schema;
@@ -107,6 +109,10 @@ internal sealed class ConceptStore
         var indexCursor = _reusableIndexCursor;
         var tableCursor = _reusableTableCursor;
 
+        // Devirtualization for WASM
+        var cachedTableCursor = tableCursor as BTreeCursor<CachedPageSource>;
+        var memoryTableCursor = tableCursor as BTreeCursor<MemoryPageSource>;
+
         indexCursor.Reset();
         if (!indexCursor.SeekFirst(key.Value))
             return null;
@@ -115,16 +121,28 @@ internal sealed class ConceptStore
         {
             var indexPayload = indexCursor.Payload;
             int indexColCount = _decoder.ReadSerialTypes(indexPayload, _indexSerialsBuffer, out int indexBodyOffset);
-            _decoder.ComputeColumnOffsets(_indexSerialsBuffer, indexColCount, indexBodyOffset, _indexOffsetsBuffer);
-
-            long indexValue = _decoder.DecodeInt64At(indexPayload, _indexSerialsBuffer[0], _indexOffsetsBuffer[0]);
+            
+            // Only need column [0] (key) and [last] (rowid)
+            int keyOffset = indexBodyOffset;
+            long keySt = _indexSerialsBuffer[0];
+            
+            long indexValue = _decoder.DecodeInt64At(indexPayload, keySt, keyOffset);
             if (indexValue > key.Value) return null;
             if (indexValue != key.Value) continue;
 
-            long rowId = _decoder.DecodeInt64At(indexPayload, _indexSerialsBuffer[indexColCount - 1], _indexOffsetsBuffer[indexColCount - 1]);
+            // Compute rowid offset (last column)
+            int rowIdOrdinal = indexColCount - 1;
+            RecordDecoder.ComputeColumnOffsetsIncremental(_indexSerialsBuffer, 0, indexColCount, indexBodyOffset, _indexOffsetsBuffer);
+            long rowId = _decoder.DecodeInt64At(indexPayload, _indexSerialsBuffer[rowIdOrdinal], _indexOffsetsBuffer[rowIdOrdinal]);
+
             if (tableCursor.Seek(rowId))
             {
-                return MapToRecordSelective(tableCursor.Payload, includeData);
+                ReadOnlySpan<byte> payload;
+                if (cachedTableCursor != null) payload = cachedTableCursor.Payload;
+                else if (memoryTableCursor != null) payload = memoryTableCursor.Payload;
+                else payload = tableCursor.Payload;
+                
+                return MapToRecordSelective(payload, includeData);
             }
         }
         while (indexCursor.MoveNext());
@@ -162,13 +180,29 @@ internal sealed class ConceptStore
         var cursor = _reusableScanCursor;
         cursor.Reset();
 
+        // Devirtualization
+        var cachedCursor = cursor as BTreeCursor<CachedPageSource>;
+        var memoryCursor = cursor as BTreeCursor<MemoryPageSource>;
+
         while (cursor.MoveNext())
         {
-            var payload = cursor.Payload;
+            ReadOnlySpan<byte> payload;
+            if (cachedCursor != null) payload = cachedCursor.Payload;
+            else if (memoryCursor != null) payload = memoryCursor.Payload;
+            else payload = cursor.Payload;
+
             _decoder.ReadSerialTypes(payload, _serialsBuffer, out int bodyOffset);
-            _decoder.ComputeColumnOffsets(_serialsBuffer, _columnCount, bodyOffset, _offsetsBuffer);
+            
+            // Lazy offset for _colKey
+            int keyOffset = RecordDecoder.ComputeColumnOffsetsIncremental(_serialsBuffer, 0, _colKey + 1, bodyOffset, _offsetsBuffer);
             long barId = _colKey >= 0 && _colKey < _columnCount ? _decoder.DecodeInt64At(payload, _serialsBuffer[_colKey], _offsetsBuffer[_colKey]) : 0;
             if (barId != key.Value) continue;
+            
+            // Now compute remaining offsets if needed for MapToRecordSelectiveWithOffsets
+            if (includeData)
+            {
+                RecordDecoder.ComputeColumnOffsetsIncremental(_serialsBuffer, _colKey + 1, _columnCount, keyOffset, _offsetsBuffer);
+            }
             return MapToRecordSelectiveWithOffsets(payload, includeData);
         }
         return null;
@@ -231,12 +265,23 @@ internal sealed class ConceptStore
         var cursor = _reusableScanCursor;
         cursor.Reset();
 
+        // Devirtualization
+        var cachedCursor = cursor as BTreeCursor<CachedPageSource>;
+        var memoryCursor = cursor as BTreeCursor<MemoryPageSource>;
+
         var keys = new List<NodeKey>();
         while (cursor.MoveNext())
         {
-            var payload = cursor.Payload;
+            ReadOnlySpan<byte> payload;
+            if (cachedCursor != null) payload = cachedCursor.Payload;
+            else if (memoryCursor != null) payload = memoryCursor.Payload;
+            else payload = cursor.Payload;
+
             _decoder.ReadSerialTypes(payload, _serialsBuffer, out int bodyOffset);
-            _decoder.ComputeColumnOffsets(_serialsBuffer, _columnCount, bodyOffset, _offsetsBuffer);
+            
+            // Optimization: Only compute offsets up to _colKey
+            RecordDecoder.ComputeColumnOffsetsIncremental(_serialsBuffer, 0, _colKey + 1, bodyOffset, _offsetsBuffer);
+            
             long keyVal = _colKey >= 0 && _colKey < _columnCount
                 ? _decoder.DecodeInt64At(payload, _serialsBuffer[_colKey], _offsetsBuffer[_colKey])
                 : 0;

@@ -11,6 +11,8 @@ using Sharc.Core.BTree;
 using Sharc.Core.IO;
 using Sharc.Core.Schema;
 using Sharc.Core.Query;
+using Sharc.Core.Records;
+using Sharc.Core.Primitives;
 using Sharc.Query;
 using Sharc.Views;
 
@@ -217,6 +219,7 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
     private readonly IRecordDecoder? _recordDecoder;
     private readonly IReadOnlyList<ColumnInfo>? _columns;
     private readonly int[]? _projection;
+    private readonly int[]? _projectedPhysicalOrdinals;
     private readonly Dictionary<int, int[]>? _mergedColumns;
     private readonly int[]? _physicalOrdinals;
     private ColumnValue[]? _currentRow;
@@ -254,6 +257,7 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
     private int _decodedGeneration;
     private int _scannedRowCount;
     private int _returnedRowCount;
+    private readonly int _decodeColumnCount;
     private readonly QueryExecutionStrategy _executionStrategy;
     private QueryExecutionInfo? _executionInfoOverride;
 
@@ -269,6 +273,7 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
     private short _filterBodyOffset;              // Per-row: payload body offset from filter pass
     private short _filterColCount;                // Per-row: serial type count from filter pass
     private short _currentBodyOffset;             // Per-row: payload body offset from main decode pass
+    private short _lastComputedOffsetOrdinal;      // Tracks how many offsets are current for this row
 
     /// <summary>
     /// Scan mode flags stored in <see cref="_scanMode"/>.
@@ -487,6 +492,28 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
             _physicalOrdinals[columns.Count] = physicalColumnCount; // sentinel for PhysicalColumnCount
         }
 
+        if (_projection != null)
+        {
+            _projectedPhysicalOrdinals = new int[_projection.Length];
+            int maxPhysicalOrdinal = -1;
+            for (int i = 0; i < _projection.Length; i++)
+            {
+                int logicalOrdinal = _projection[i];
+                int physicalOrdinal = _physicalOrdinals != null
+                    ? _physicalOrdinals[logicalOrdinal]
+                    : logicalOrdinal;
+                _projectedPhysicalOrdinals[i] = physicalOrdinal;
+                if (physicalOrdinal > maxPhysicalOrdinal)
+                    maxPhysicalOrdinal = physicalOrdinal;
+            }
+
+            _decodeColumnCount = maxPhysicalOrdinal + 1;
+        }
+        else
+        {
+            _decodeColumnCount = physicalColumnCount;
+        }
+
         int bufferSize = physicalColumnCount;
 
         // Rent a reusable buffer from ArrayPool — returned in Dispose()
@@ -539,6 +566,7 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         _composite = new CompositeState(rows, columnNames);
         _columnCount = (short)columnNames.Length;
         _rowidAliasOrdinal = -1;
+        _decodeColumnCount = 0;
         _executionStrategy = QueryExecutionStrategy.Materialized;
     }
 
@@ -551,6 +579,7 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         _composite = new CompositeState(rows, columnNames);
         _columnCount = (short)columnNames.Length;
         _rowidAliasOrdinal = -1;
+        _decodeColumnCount = 0;
         _executionStrategy = QueryExecutionStrategy.Materialized;
     }
 
@@ -563,6 +592,7 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         _composite = new CompositeState(rows, columnNames);
         _columnCount = (short)columnNames.Length;
         _rowidAliasOrdinal = -1;
+        _decodeColumnCount = 0;
         _executionStrategy = QueryExecutionStrategy.Materialized;
     }
 
@@ -575,6 +605,7 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         _composite = new CompositeState(first, second, columnNames);
         _columnCount = (short)columnNames.Length;
         _rowidAliasOrdinal = -1;
+        _decodeColumnCount = 0;
         _executionStrategy = QueryExecutionStrategy.Concat;
     }
 
@@ -589,6 +620,7 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         _composite = new CompositeState(underlying, mode, rightIndex);
         _columnCount = (short)underlying.FieldCount;
         _rowidAliasOrdinal = -1;
+        _decodeColumnCount = 0;
         _executionStrategy = QueryExecutionStrategy.SetDedup;
     }
 
@@ -940,6 +972,16 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         };
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int ResolveActualOrdinal(int ordinal)
+    {
+        if (_projectedPhysicalOrdinals != null)
+            return _projectedPhysicalOrdinals[ordinal];
+        if (_physicalOrdinals != null)
+            return _physicalOrdinals[ordinal];
+        return ordinal;
+    }
+
     /// <summary>
     /// Advances the reader to the next row.
     /// </summary>
@@ -1054,8 +1096,7 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
                 return false;
 
             _currentBodyOffset = (short)bodyOffset;
-            int cols = Math.Min(PhysicalColumnCount, st.Length);
-            decoder.ComputeColumnOffsets(st.AsSpan(0, cols), cols, bodyOffset, _columnOffsets.AsSpan(0, cols));
+            _lastComputedOffsetOrdinal = -1;
             _decodedGeneration++;
             IsLazy = true;
             _currentRow = _reusableBuffer;
@@ -1094,6 +1135,7 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         if (_filter?.RowAccessEvaluator != null && !_filter.RowAccessEvaluator.CanAccess(payload, rowId))
             return false;
 
+        _lastComputedOffsetOrdinal = -1;
         DecodeCurrentRow(payload);
         return true;
     }
@@ -1144,10 +1186,7 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
             _currentBodyOffset = (short)bodyOff;
         }
 
-        // Precompute cumulative column offsets — O(K) once per row.
-        int colCount = Math.Min(PhysicalColumnCount, _serialTypes!.Length);
-        _recordDecoder!.ComputeColumnOffsets(_serialTypes.AsSpan(0, colCount), colCount, _currentBodyOffset, _columnOffsets.AsSpan(0, colCount));
-
+        _lastComputedOffsetOrdinal = -1;
         _decodedGeneration++;
         IsLazy = true;
         _currentRow = _reusableBuffer;
@@ -1164,17 +1203,14 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         if (_currentRow == null)
             throw new InvalidOperationException("No current row. Call Read() first.");
 
-        int logicalOrdinal = _projection != null ? _projection[ordinal] : ordinal;
-        int actualOrdinal = _physicalOrdinals != null
-            ? _physicalOrdinals[logicalOrdinal]
-            : logicalOrdinal;
+        int actualOrdinal = ResolveActualOrdinal(ordinal);
 
         // Fast path: in lazy mode, check serial type directly (no body decode needed).
         // _serialTypes is already populated by DecodeCurrentRow() — no re-parse needed.
         if (IsLazy)
         {
             // INTEGER PRIMARY KEY stores NULL in record; real value is rowid — not actually null
-            if (actualOrdinal == _rowidAliasOrdinal && _serialTypes![actualOrdinal] == 0)
+            if (actualOrdinal == _rowidAliasOrdinal)
                 return false;
             return _serialTypes![actualOrdinal] == 0;
         }
@@ -1194,13 +1230,43 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         // Fast path: decode directly from page span using precomputed O(1) offset
         if (IsLazy)
         {
-            int actualOrdinal = _projection != null ? _projection[ordinal] : ordinal;
-            if (_physicalOrdinals != null) actualOrdinal = _physicalOrdinals[actualOrdinal];
+            int actualOrdinal = ResolveActualOrdinal(ordinal);
             if (actualOrdinal == _rowidAliasOrdinal)
+            {
+                if (_btreeCachedCursor != null) return _btreeCachedCursor.RowId;
+                if (_btreeMemoryCursor != null) return _btreeMemoryCursor.RowId;
                 return _cursor!.RowId;
+            }
+
+            EnsureOffsetsComputed(actualOrdinal);
+            
+            if (_btreeCachedCursor != null)
+                return _recordDecoder!.DecodeInt64At(_btreeCachedCursor.Payload, _serialTypes![actualOrdinal], _columnOffsets![actualOrdinal]);
+            if (_btreeMemoryCursor != null)
+                return _recordDecoder!.DecodeInt64At(_btreeMemoryCursor.Payload, _serialTypes![actualOrdinal], _columnOffsets![actualOrdinal]);
+                
             return _recordDecoder!.DecodeInt64At(_cursor!.Payload, _serialTypes![actualOrdinal], _columnOffsets![actualOrdinal]);
         }
         return GetColumnValue(ordinal).AsInt64();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnsureOffsetsComputed(int targetOrdinal)
+    {
+        if (targetOrdinal > _lastComputedOffsetOrdinal)
+        {
+            int start = _lastComputedOffsetOrdinal + 1;
+            int startOffset = start == 0 ? _currentBodyOffset : _columnOffsets![start - 1] + SerialTypeCodec.GetContentSize(_serialTypes![start - 1]);
+            
+            int nextOffset = RecordDecoder.ComputeColumnOffsetsIncremental(
+                _serialTypes!, 
+                start, 
+                targetOrdinal + 1, 
+                startOffset, 
+                _columnOffsets!);
+            
+            _lastComputedOffsetOrdinal = (short)targetOrdinal;
+        }
     }
 
     /// <summary>
@@ -1223,10 +1289,20 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         // Fast path: decode directly from page span using precomputed O(1) offset
         if (IsLazy)
         {
-            int actualOrdinal = _projection != null ? _projection[ordinal] : ordinal;
-            if (_physicalOrdinals != null) actualOrdinal = _physicalOrdinals[actualOrdinal];
+            int actualOrdinal = ResolveActualOrdinal(ordinal);
+            if (actualOrdinal == _rowidAliasOrdinal)
+                goto Fallback; // RowId requires conversion
+
+            EnsureOffsetsComputed(actualOrdinal);
+
+            if (_btreeCachedCursor != null)
+                return _recordDecoder!.DecodeDoubleAt(_btreeCachedCursor.Payload, _serialTypes![actualOrdinal], _columnOffsets![actualOrdinal]);
+            if (_btreeMemoryCursor != null)
+                return _recordDecoder!.DecodeDoubleAt(_btreeMemoryCursor.Payload, _serialTypes![actualOrdinal], _columnOffsets![actualOrdinal]);
+
             return _recordDecoder!.DecodeDoubleAt(_cursor!.Payload, _serialTypes![actualOrdinal], _columnOffsets![actualOrdinal]);
         }
+    Fallback:
         return GetColumnValue(ordinal).AsDouble();
     }
 
@@ -1253,10 +1329,15 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
             long lo;
             if (IsLazy)
             {
-                hi = _recordDecoder!.DecodeInt64At(
-                    _cursor!.Payload, _serialTypes![phys[0]], _columnOffsets![phys[0]]);
-                lo = _recordDecoder!.DecodeInt64At(
-                    _cursor!.Payload, _serialTypes[phys[1]], _columnOffsets[phys[1]]);
+                EnsureOffsetsComputed(phys[1]);
+
+                ReadOnlySpan<byte> rowPayload;
+                if (_btreeCachedCursor != null) rowPayload = _btreeCachedCursor.Payload;
+                else if (_btreeMemoryCursor != null) rowPayload = _btreeMemoryCursor.Payload;
+                else rowPayload = _cursor!.Payload;
+
+                hi = _recordDecoder!.DecodeInt64At(rowPayload, _serialTypes![phys[0]], _columnOffsets![phys[0]]);
+                lo = _recordDecoder!.DecodeInt64At(rowPayload, _serialTypes[phys[1]], _columnOffsets[phys[1]]);
             }
             else
             {
@@ -1275,12 +1356,19 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
             int actualOrdinal = logicalOrdinal;
             if (_physicalOrdinals != null) actualOrdinal = _physicalOrdinals[actualOrdinal];
 
+            EnsureOffsetsComputed(actualOrdinal);
+
             long serialType = _serialTypes![actualOrdinal];
             if (serialType != Core.Primitives.DecimalCodec.DecimalSerialType)
                 throw new InvalidOperationException($"Column {ordinal} is not a decimal payload (serial type {serialType}).");
 
+            ReadOnlySpan<byte> rowPayload;
+            if (_btreeCachedCursor != null) rowPayload = _btreeCachedCursor.Payload;
+            else if (_btreeMemoryCursor != null) rowPayload = _btreeMemoryCursor.Payload;
+            else rowPayload = _cursor!.Payload;
+
             return Core.Primitives.DecimalCodec.Decode(
-                _cursor!.Payload.Slice(_columnOffsets![actualOrdinal], Core.Primitives.DecimalCodec.ByteCount));
+                rowPayload.Slice(_columnOffsets![actualOrdinal], Core.Primitives.DecimalCodec.ByteCount));
         }
 
         return GetColumnValue(ordinal).AsDecimal();
@@ -1298,10 +1386,20 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         // Fast path: decode UTF-8 directly from page span using precomputed O(1) offset
         if (IsLazy)
         {
-            int actualOrdinal = _projection != null ? _projection[ordinal] : ordinal;
-            if (_physicalOrdinals != null) actualOrdinal = _physicalOrdinals[actualOrdinal];
+            int actualOrdinal = ResolveActualOrdinal(ordinal);
+            if (actualOrdinal == _rowidAliasOrdinal)
+                goto Fallback;
+
+            EnsureOffsetsComputed(actualOrdinal);
+
+            if (_btreeCachedCursor != null)
+                return _recordDecoder!.DecodeStringAt(_btreeCachedCursor.Payload, _serialTypes![actualOrdinal], _columnOffsets![actualOrdinal]);
+            if (_btreeMemoryCursor != null)
+                return _recordDecoder!.DecodeStringAt(_btreeMemoryCursor.Payload, _serialTypes![actualOrdinal], _columnOffsets![actualOrdinal]);
+
             return _recordDecoder!.DecodeStringAt(_cursor!.Payload, _serialTypes![actualOrdinal], _columnOffsets![actualOrdinal]);
         }
+    Fallback:
         return GetColumnValue(ordinal).AsString();
     }
 
@@ -1312,6 +1410,9 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
     {
         if (_composite != null)
             return _composite.GetBlob(this, ordinal);
+
+        if (TryGetLazyPayloadBytes(ordinal, expectText: false, out ReadOnlySpan<byte> bytes))
+            return bytes.ToArray();
 
         return GetColumnValue(ordinal).AsBytes().ToArray();
     }
@@ -1325,7 +1426,55 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         if (_composite != null)
             return _composite.GetBlobSpan(this, ordinal);
 
+        if (TryGetLazyPayloadBytes(ordinal, expectText: false, out ReadOnlySpan<byte> bytes))
+            return bytes;
+
         return GetColumnValue(ordinal).AsBytes().Span;
+    }
+
+    /// <summary>
+    /// Returns raw bytes directly from the current record payload for lazy rows,
+    /// avoiding per-column materialization when callers only need a span view.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryGetLazyPayloadBytes(int ordinal, bool expectText, out ReadOnlySpan<byte> bytes)
+    {
+        bytes = default;
+        if (!IsLazy || _currentRow == null)
+            return false;
+
+        int logicalOrdinal = _projection != null ? _projection[ordinal] : ordinal;
+        if (logicalOrdinal < 0 || logicalOrdinal >= _columnCount)
+            throw new ArgumentOutOfRangeException(nameof(ordinal), ordinal,
+                "Column ordinal is out of range.");
+
+        int actualOrdinal = _physicalOrdinals != null
+            ? _physicalOrdinals[logicalOrdinal]
+            : logicalOrdinal;
+
+        EnsureOffsetsComputed(actualOrdinal);
+
+        // INTEGER PRIMARY KEY aliases are virtual rowid values, not payload bytes.
+        if (actualOrdinal == _rowidAliasOrdinal)
+            return false;
+
+        long serialType = _serialTypes![actualOrdinal];
+        bool storageMatches = expectText
+            ? Core.Primitives.SerialTypeCodec.IsText(serialType)
+            : Core.Primitives.SerialTypeCodec.IsBlob(serialType);
+        if (!storageMatches)
+            return false;
+
+        int offset = _columnOffsets![actualOrdinal];
+        int length = Core.Primitives.SerialTypeCodec.GetContentSize(serialType);
+        
+        ReadOnlySpan<byte> payload;
+        if (_btreeCachedCursor != null) payload = _btreeCachedCursor.Payload;
+        else if (_btreeMemoryCursor != null) payload = _btreeMemoryCursor.Payload;
+        else payload = _cursor!.Payload;
+        
+        bytes = payload.Slice(offset, length);
+        return true;
     }
 
     /// <summary>
@@ -1437,8 +1586,15 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         // Lazy decode: decode this column on first access using precomputed O(1) offset
         if (IsLazy && _decodedGenerations![actualOrdinal] != _decodedGeneration)
         {
+            EnsureOffsetsComputed(actualOrdinal);
+            
+            ReadOnlySpan<byte> payload;
+            if (_btreeCachedCursor != null) payload = _btreeCachedCursor.Payload;
+            else if (_btreeMemoryCursor != null) payload = _btreeMemoryCursor.Payload;
+            else payload = _cursor!.Payload;
+
             _reusableBuffer![actualOrdinal] = _recordDecoder!.DecodeColumnAt(
-                _cursor!.Payload, _serialTypes![actualOrdinal], _columnOffsets![actualOrdinal]);
+                payload, _serialTypes![actualOrdinal], _columnOffsets![actualOrdinal]);
             _decodedGenerations[actualOrdinal] = _decodedGeneration;
         }
 
@@ -1446,7 +1602,13 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
 
         // INTEGER PRIMARY KEY columns store NULL in the record; the real value is the rowid.
         if (actualOrdinal == _rowidAliasOrdinal && value.IsNull)
-            return ColumnValue.FromInt64(1, _cursor!.RowId);
+        {
+            long rowId;
+            if (_btreeCachedCursor != null) rowId = _btreeCachedCursor.RowId;
+            else if (_btreeMemoryCursor != null) rowId = _btreeMemoryCursor.RowId;
+            else rowId = _cursor!.RowId;
+            return ColumnValue.FromInt64(1, rowId);
+        }
 
         return value;
     }
@@ -1460,6 +1622,9 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
     {
         if (_composite != null)
             return _composite.GetUtf8Span(this, ordinal);
+
+        if (TryGetLazyPayloadBytes(ordinal, expectText: true, out ReadOnlySpan<byte> utf8))
+            return utf8;
 
         return GetColumnValue(ordinal).AsBytes().Span;
     }
@@ -1486,10 +1651,15 @@ public sealed partial class SharcDataReader : IRowAccessor, IDisposable
         // Zero-alloc: DecodeInt64At reads directly from the page span using precomputed O(1) offset.
         if (_mergedColumns != null && _mergedColumns.TryGetValue(logicalOrdinal, out var phys))
         {
-            long hi = _recordDecoder!.DecodeInt64At(
-                _cursor!.Payload, _serialTypes![phys[0]], _columnOffsets![phys[0]]);
-            long lo = _recordDecoder!.DecodeInt64At(
-                _cursor!.Payload, _serialTypes[phys[1]], _columnOffsets[phys[1]]);
+            EnsureOffsetsComputed(phys[1]); // Ensure both hi/lo offsets are ready
+            
+            ReadOnlySpan<byte> payload;
+            if (_btreeCachedCursor != null) payload = _btreeCachedCursor.Payload;
+            else if (_btreeMemoryCursor != null) payload = _btreeMemoryCursor.Payload;
+            else payload = _cursor!.Payload;
+
+            long hi = _recordDecoder!.DecodeInt64At(payload, _serialTypes![phys[0]], _columnOffsets![phys[0]]);
+            long lo = _recordDecoder!.DecodeInt64At(payload, _serialTypes![phys[1]], _columnOffsets![phys[1]]);
             return Core.Primitives.GuidCodec.FromInt64Pair(hi, lo);
         }
 

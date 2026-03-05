@@ -26,6 +26,29 @@ public class SchemaReaderTests
     // ── Single table ──
 
     [Fact]
+    public void ReadSchema_CachesResult_ReturnsSameInstance()
+    {
+        var rows = new[]
+        {
+            MakeSchemaRow("table", "users", "users", 2,
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+        };
+
+        var reader = CreateSchemaReader(rows);
+        
+        // First read - clears cache and populates it
+        var firstSchema = reader.ReadSchema();
+        
+        // Second read - should return exactly the same object instance
+        var secondSchema = reader.ReadSchema();
+        
+        Assert.Same(firstSchema, secondSchema);
+        
+        // Verify it actually has data
+        Assert.Contains(firstSchema.Tables, t => t.Name == "users");
+    }
+
+    [Fact]
     public void ReadSchema_SingleTable_ParsesTableInfo()
     {
         var rows = new[]

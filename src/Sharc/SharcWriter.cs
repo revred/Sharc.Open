@@ -50,6 +50,76 @@ public sealed class SharcWriter : IDisposable
         return new SharcWriter(db, ownsDb: false);
     }
 
+    // ─────────────────────────────────────────────────────────────
+    //  WriteScope APIs — disposal-safe write operations
+    // ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// <b>Recommended API.</b> Executes a write action within a guaranteed-disposal scope.
+    /// The scope auto-commits on success and rolls back on exception.
+    /// Disposal is automatic — the caller cannot forget <c>using</c>.
+    /// <code>
+    /// SharcWriter.WriteScope("data.arc", scope =>
+    /// {
+    ///     scope.Insert("events", values1);
+    ///     scope.Insert("events", values2);
+    /// });
+    /// // auto-committed — no way to leak the scope
+    /// </code>
+    /// </summary>
+    public static void WriteScope(string path, Action<WriteScope> action)
+    {
+        using var scope = OpenScope(path);
+        action(scope);
+    }
+
+    /// <summary>
+    /// <b>Recommended API.</b> Executes a write function within a guaranteed-disposal scope
+    /// and returns a result.
+    /// <code>
+    /// long id = SharcWriter.WriteScope("data.arc", scope =>
+    /// {
+    ///     return scope.Insert("events", values);
+    /// });
+    /// </code>
+    /// </summary>
+    public static TResult WriteScope<TResult>(string path, Func<WriteScope, TResult> action)
+    {
+        using var scope = OpenScope(path);
+        return action(scope);
+    }
+
+    /// <summary>
+    /// Opens a database and returns an RAII-style <see cref="Sharc.WriteScope"/> that
+    /// auto-commits on Dispose. Prefer <see cref="WriteScope(string, Action{WriteScope})"/>
+    /// which guarantees disposal. Use this only when you need the scope to span
+    /// multiple statements or control Flush/Finalize timing.
+    /// <para><b>Important:</b> Always use a <c>using</c> statement or <c>using var</c>
+    /// declaration. Without <c>using</c>, pending writes are lost and the file lock
+    /// leaks until GC finalization (which fires a <c>Debug.Fail</c> to catch the bug).</para>
+    /// <code>
+    /// using var scope = SharcWriter.OpenScope("data.arc");
+    /// scope.Insert("events", values);
+    /// // auto-commits when scope is disposed
+    /// </code>
+    /// </summary>
+    public static WriteScope OpenScope(string path)
+    {
+        var db = SharcDatabase.Open(path, new SharcOpenOptions { Writable = true, PageCacheSize = 16 });
+        return new WriteScope(db, ownsDb: true);
+    }
+
+    /// <summary>
+    /// Creates a <see cref="Sharc.WriteScope"/> over an existing database.
+    /// The caller retains ownership of the database.
+    /// <para><b>Important:</b> Always use a <c>using</c> statement or <c>using var</c>
+    /// declaration.</para>
+    /// </summary>
+    public static WriteScope Scope(SharcDatabase db)
+    {
+        return new WriteScope(db, ownsDb: false);
+    }
+
     private SharcWriter(SharcDatabase db, bool ownsDb)
     {
         _db = db;
@@ -313,6 +383,8 @@ public sealed class SharcWriter : IDisposable
 
     /// <summary>
     /// Core insert: encode record → insert into B-tree via the transaction's shadow source.
+    /// For tables with an INTEGER PRIMARY KEY column, the caller's explicit value is used
+    /// as the B-tree rowid and NULL is stored at that position in the record (matching SQLite).
     /// </summary>
     internal static long InsertCore(Transaction tx, string tableName, ColumnValue[] values,
         TableInfo? tableInfo = null, Dictionary<string, uint>? rootCache = null)
@@ -329,8 +401,30 @@ public sealed class SharcWriter : IDisposable
         if (rootPage == 0)
             throw new InvalidOperationException($"Table '{tableName}' not found.");
 
-        var mutator = tx.FetchMutator(usableSize);
-        long rowId = mutator.GetMaxRowId(rootPage) + 1;
+        // Snapshot values before IPK nullification — needed for index maintenance
+        ColumnValue[]? indexValues = tableInfo?.Indexes.Count > 0
+            ? (ColumnValue[])values.Clone()
+            : null;
+
+        // Detect INTEGER PRIMARY KEY (rowid alias):
+        // Use caller's explicit value as rowid; store NULL at IPK position in record.
+        int ipkOrdinal = FindIpkOrdinal(tableInfo, values.Length);
+        long rowId;
+        if (ipkOrdinal >= 0 && !values[ipkOrdinal].IsNull)
+        {
+            rowId = values[ipkOrdinal].AsInt64();
+            values[ipkOrdinal] = ColumnValue.Null();
+        }
+        else
+        {
+            rowId = tx.FetchMutator(usableSize).GetMaxRowId(rootPage) + 1;
+            if (ipkOrdinal >= 0)
+                values[ipkOrdinal] = ColumnValue.Null();
+        }
+
+        // Restore IPK value in the index snapshot so indexed columns see the actual value
+        if (indexValues != null && ipkOrdinal >= 0)
+            indexValues[ipkOrdinal] = ColumnValue.FromInt64(6, rowId);
 
         // Encode the record
         int encodedSize = RecordEncoder.ComputeEncodedSize(values);
@@ -338,6 +432,7 @@ public sealed class SharcWriter : IDisposable
         RecordEncoder.EncodeRecord(values, recordBuf);
 
         // Insert into B-tree
+        var mutator = tx.FetchMutator(usableSize);
         uint newRoot = mutator.Insert(rootPage, rowId, recordBuf);
         tx.TrackRowMutation(tableName, rowId);
 
@@ -346,6 +441,10 @@ public sealed class SharcWriter : IDisposable
             if (rootCache != null) rootCache[tableName] = newRoot;
             UpdateTableRootPage(shadow, tableName, newRoot, usableSize);
         }
+
+        // Maintain secondary indexes
+        if (indexValues != null)
+            MaintainIndexesOnInsert(tx, tableName, rowId, indexValues, tableInfo, usableSize, rootCache);
 
         return rowId;
     }
@@ -362,6 +461,19 @@ public sealed class SharcWriter : IDisposable
         if (tableInfo != null)
             values = ExpandMergedColumns(values, tableInfo);
 
+        // Snapshot values before IPK nullification for index maintenance
+        ColumnValue[]? indexValues = tableInfo?.Indexes.Count > 0
+            ? (ColumnValue[])values.Clone()
+            : null;
+
+        // Nullify IPK column — rowid is already passed explicitly
+        int ipkOrdinal = FindIpkOrdinal(tableInfo, values.Length);
+        if (ipkOrdinal >= 0)
+            values[ipkOrdinal] = ColumnValue.Null();
+
+        if (indexValues != null && ipkOrdinal >= 0)
+            indexValues[ipkOrdinal] = ColumnValue.FromInt64(6, rowId);
+
         uint rootPage = FindTableRootPageCached(shadow, tableName, usableSize, rootCache);
         if (rootPage == 0)
             throw new InvalidOperationException($"Table '{tableName}' not found.");
@@ -380,14 +492,19 @@ public sealed class SharcWriter : IDisposable
             UpdateTableRootPage(shadow, tableName, newRoot, usableSize);
         }
 
+        // Maintain secondary indexes
+        if (indexValues != null)
+            MaintainIndexesOnInsert(tx, tableName, rowId, indexValues, tableInfo, usableSize, rootCache);
+
         return rowId;
     }
 
     /// <summary>
     /// Core delete: find table root → mutator.Delete → update root if changed.
+    /// Maintains secondary indexes if tableInfo is provided.
     /// </summary>
     internal static bool DeleteCore(Transaction tx, string tableName, long rowId,
-        Dictionary<string, uint>? rootCache = null)
+        Dictionary<string, uint>? rootCache = null, TableInfo? tableInfo = null)
     {
         var shadow = tx.GetShadowSource();
         int usableSize = shadow.PageSize;
@@ -396,11 +513,22 @@ public sealed class SharcWriter : IDisposable
         if (rootPage == 0)
             throw new InvalidOperationException($"Table '{tableName}' not found.");
 
+        // Read old values before delete for index maintenance
+        ColumnValue[]? oldValues = null;
+        if (tableInfo?.Indexes.Count > 0)
+        {
+            oldValues = ReadOldValues(shadow, rootPage, rowId, usableSize, tableInfo.Columns.Count);
+        }
+
         var mutator = tx.FetchMutator(usableSize);
         var (found, newRoot) = mutator.Delete(rootPage, rowId);
 
         if (found)
             tx.TrackRowMutation(tableName, rowId);
+
+        // Remove old entries from secondary indexes
+        if (found && oldValues != null)
+            MaintainIndexesOnDelete(tx, tableName, rowId, oldValues, tableInfo, usableSize, rootCache);
 
         if (found && newRoot != rootPage)
         {
@@ -413,6 +541,8 @@ public sealed class SharcWriter : IDisposable
 
     /// <summary>
     /// Core update: find table root → encode record → mutator.Update → update root if changed.
+    /// For tables with an INTEGER PRIMARY KEY column, NULL is stored at that position
+    /// in the record (the real value is the B-tree rowid, matching SQLite).
     /// </summary>
     internal static bool UpdateCore(Transaction tx, string tableName, long rowId, ColumnValue[] values,
         TableInfo? tableInfo = null, Dictionary<string, uint>? rootCache = null)
@@ -424,9 +554,33 @@ public sealed class SharcWriter : IDisposable
         if (tableInfo != null)
             values = ExpandMergedColumns(values, tableInfo);
 
+        // Snapshot new values before IPK nullification — needed for index maintenance
+        ColumnValue[]? newIndexValues = tableInfo?.Indexes.Count > 0
+            ? (ColumnValue[])values.Clone()
+            : null;
+
+        // Nullify IPK column — rowid is already passed explicitly
+        int ipkOrdinal = FindIpkOrdinal(tableInfo, values.Length);
+        if (ipkOrdinal >= 0)
+            values[ipkOrdinal] = ColumnValue.Null();
+
+        // Restore IPK value in the index snapshot
+        if (newIndexValues != null && ipkOrdinal >= 0)
+            newIndexValues[ipkOrdinal] = ColumnValue.FromInt64(6, rowId);
+
         uint rootPage = FindTableRootPageCached(shadow, tableName, usableSize, rootCache);
         if (rootPage == 0)
             throw new InvalidOperationException($"Table '{tableName}' not found.");
+
+        // Read old values before update for index maintenance
+        ColumnValue[]? oldValues = null;
+        if (newIndexValues != null)
+        {
+            oldValues = ReadOldValues(shadow, rootPage, rowId, usableSize, tableInfo!.Columns.Count);
+            // Restore IPK in old values too
+            if (oldValues != null && ipkOrdinal >= 0)
+                oldValues[ipkOrdinal] = ColumnValue.FromInt64(6, rowId);
+        }
 
         int encodedSize = RecordEncoder.ComputeEncodedSize(values);
         Span<byte> recordBuf = encodedSize <= 512 ? stackalloc byte[encodedSize] : new byte[encodedSize];
@@ -437,6 +591,13 @@ public sealed class SharcWriter : IDisposable
 
         if (found)
             tx.TrackRowMutation(tableName, rowId);
+
+        // Update secondary indexes: delete old entries, insert new entries
+        if (found && oldValues != null && newIndexValues != null)
+        {
+            MaintainIndexesOnDelete(tx, tableName, rowId, oldValues, tableInfo, usableSize, rootCache);
+            MaintainIndexesOnInsert(tx, tableName, rowId, newIndexValues, tableInfo, usableSize, rootCache);
+        }
 
         if (found && newRoot != rootPage)
         {
@@ -469,6 +630,30 @@ public sealed class SharcWriter : IDisposable
         for (int i = 0; i < cols.Length; i++)
             cols[i] = table.Columns[i].Name;
         return cols;
+    }
+
+    /// <summary>
+    /// Finds the ordinal of the INTEGER PRIMARY KEY column (rowid alias), or -1 if none.
+    /// SQLite treats INTEGER PRIMARY KEY as an alias for the B-tree rowid: the caller's
+    /// explicit value becomes the rowid and NULL is stored at that position in the record.
+    /// Only returns a valid ordinal when the caller provides values for ALL columns
+    /// (including the IPK column). When the caller omits the IPK column (passes N-1
+    /// values for an N-column table), returns -1 to fall back to auto-rowid.
+    /// </summary>
+    private static int FindIpkOrdinal(TableInfo? tableInfo, int valueCount)
+    {
+        if (tableInfo == null) return -1;
+        var columns = tableInfo.Columns;
+        // Only apply IPK handling when the caller passes all columns.
+        // If they pass fewer values, they're omitting the IPK column (auto-rowid).
+        if (valueCount < columns.Count) return -1;
+        for (int i = 0; i < columns.Count; i++)
+        {
+            if (columns[i].IsPrimaryKey &&
+                columns[i].DeclaredType.Equals("INTEGER", StringComparison.OrdinalIgnoreCase))
+                return columns[i].Ordinal;
+        }
+        return -1;
     }
 
     /// <summary>
@@ -565,6 +750,169 @@ public sealed class SharcWriter : IDisposable
             mutator.Update(1, rowId, buf);
             return;
         }
+    }
+
+    // ── Secondary Index Maintenance ──────────────────────────────
+
+    /// <summary>
+    /// Inserts entries into all secondary indexes on the given table for the specified row.
+    /// Called after a row is inserted into the table B-tree.
+    /// </summary>
+    private static void MaintainIndexesOnInsert(Transaction tx, string tableName,
+        long rowId, ColumnValue[] values, TableInfo? tableInfo, int usableSize,
+        Dictionary<string, uint>? rootCache)
+    {
+        if (tableInfo == null) return;
+        var indexes = tableInfo.Indexes;
+        if (indexes.Count == 0) return;
+
+        var shadow = tx.GetShadowSource();
+        var indexMutator = tx.FetchIndexMutator(usableSize);
+
+        foreach (var index in indexes)
+        {
+            var indexRecord = BuildIndexRecord(values, rowId, index, tableInfo);
+            int encodedSize = RecordEncoder.ComputeEncodedSize(indexRecord);
+            byte[] recordBuf = new byte[encodedSize];
+            RecordEncoder.EncodeRecord(indexRecord, recordBuf);
+
+            uint indexRoot = FindIndexRootPageCached(shadow, index.Name, usableSize, rootCache);
+            if (indexRoot == 0) continue;
+
+            uint newRoot = indexMutator.Insert(indexRoot, recordBuf);
+            if (newRoot != indexRoot)
+            {
+                if (rootCache != null) rootCache[index.Name] = newRoot;
+                UpdateTableRootPage(shadow, index.Name, newRoot, usableSize);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Deletes entries from all secondary indexes on the given table for the specified row.
+    /// The <paramref name="oldValues"/> must be the OLD values being removed.
+    /// </summary>
+    private static void MaintainIndexesOnDelete(Transaction tx, string tableName,
+        long rowId, ColumnValue[] oldValues, TableInfo? tableInfo, int usableSize,
+        Dictionary<string, uint>? rootCache)
+    {
+        if (tableInfo == null) return;
+        var indexes = tableInfo.Indexes;
+        if (indexes.Count == 0) return;
+
+        var shadow = tx.GetShadowSource();
+        var indexMutator = tx.FetchIndexMutator(usableSize);
+
+        foreach (var index in indexes)
+        {
+            var indexRecord = BuildIndexRecord(oldValues, rowId, index, tableInfo);
+            int encodedSize = RecordEncoder.ComputeEncodedSize(indexRecord);
+            byte[] recordBuf = new byte[encodedSize];
+            RecordEncoder.EncodeRecord(indexRecord, recordBuf);
+
+            uint indexRoot = FindIndexRootPageCached(shadow, index.Name, usableSize, rootCache);
+            if (indexRoot == 0) continue;
+
+            var (found, newRoot) = indexMutator.Delete(indexRoot, recordBuf);
+            if (found && newRoot != indexRoot)
+            {
+                if (rootCache != null) rootCache[index.Name] = newRoot;
+                UpdateTableRootPage(shadow, index.Name, newRoot, usableSize);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reads the old record values for a row from the table B-tree.
+    /// Used by UpdateCore and DeleteCore to build old index entries for removal.
+    /// </summary>
+    private static ColumnValue[]? ReadOldValues(IPageSource source, uint tableRoot,
+        long rowId, int usableSize, int columnCount)
+    {
+        using var cursor = new BTreeCursor<IPageSource>(source, tableRoot, usableSize);
+        if (!cursor.Seek(rowId)) return null;
+
+        var decoder = new RecordDecoder();
+        var values = new ColumnValue[columnCount];
+        decoder.DecodeRecord(cursor.Payload, values);
+        return values;
+    }
+
+    /// <summary>
+    /// Builds a SQLite index record: [indexed column values..., table rowid].
+    /// The rowid is always the last column in the index record.
+    /// </summary>
+    private static ColumnValue[] BuildIndexRecord(ColumnValue[] rowValues, long rowId,
+        IndexInfo index, TableInfo table)
+    {
+        var cols = index.Columns;
+        var record = new ColumnValue[cols.Count + 1];
+
+        for (int i = 0; i < cols.Count; i++)
+        {
+            // Find the column ordinal in the table
+            int ordinal = -1;
+            for (int j = 0; j < table.Columns.Count; j++)
+            {
+                if (table.Columns[j].Name.Equals(cols[i].Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    ordinal = j;
+                    break;
+                }
+            }
+
+            record[i] = ordinal >= 0 && ordinal < rowValues.Length
+                ? rowValues[ordinal]
+                : ColumnValue.Null();
+        }
+
+        // Last column is the table rowid
+        record[cols.Count] = ColumnValue.FromInt64(6, rowId);
+        return record;
+    }
+
+    /// <summary>
+    /// Finds an index root page by name, with cache.
+    /// Reuses the same root-page scanning logic as tables (both are in sqlite_master).
+    /// </summary>
+    private static uint FindIndexRootPageCached(IPageSource source, string indexName,
+        int usableSize, Dictionary<string, uint>? cache)
+    {
+        if (cache != null && cache.TryGetValue(indexName, out uint cached))
+            return cached;
+
+        uint rootPage = FindIndexRootPage(source, indexName, usableSize);
+        if (cache != null && rootPage != 0)
+            cache[indexName] = rootPage;
+
+        return rootPage;
+    }
+
+    /// <summary>
+    /// Finds the root page of an index by scanning sqlite_master.
+    /// </summary>
+    private static uint FindIndexRootPage(IPageSource source, string indexName, int usableSize)
+    {
+        using var cursor = new BTreeCursor<IPageSource>(source, 1, usableSize);
+        var columnBuffer = new ColumnValue[5];
+        var decoder = new RecordDecoder();
+
+        while (cursor.MoveNext())
+        {
+            decoder.DecodeRecord(cursor.Payload, columnBuffer);
+            if (columnBuffer[0].IsNull) continue;
+
+            string type = columnBuffer[0].AsString();
+            if (type != "index") continue;
+
+            string name = columnBuffer[1].IsNull ? "" : columnBuffer[1].AsString();
+            if (string.Equals(name, indexName, StringComparison.OrdinalIgnoreCase))
+            {
+                return columnBuffer[3].IsNull ? 0u : (uint)columnBuffer[3].AsInt64();
+            }
+        }
+
+        return 0;
     }
 
     /// <summary>

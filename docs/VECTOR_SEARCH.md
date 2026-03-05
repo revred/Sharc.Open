@@ -122,7 +122,7 @@ computation with automatic hardware dispatch (SSE2 → AVX2 → AVX-512).
 | Dimension | Sharc.Vector | Pinecone / Weaviate | pgvector | ChromaDB |
 | :--- | :--- | :--- | :--- | :--- |
 | **Deployment** | In-process (~250 KB) | Cloud / server | PostgreSQL extension | Server (Python) |
-| **Index type** | Flat scan (brute-force) | HNSW + quantization | IVFFlat / HNSW | HNSW |
+| **Index type** | Flat scan + HNSW | HNSW + quantization | IVFFlat / HNSW | HNSW |
 | **Latency (10K vectors)** | ~5-10 ms | ~10-50 ms + network | ~5-20 ms | ~20-50 ms |
 | **Scale** | ≤100K vectors | Billions | Millions | Millions |
 | **Metadata filter** | FilterStar (compiled) | Built-in | SQL WHERE | Built-in |
@@ -133,7 +133,7 @@ computation with automatic hardware dispatch (SSE2 → AVX2 → AVX-512).
 
 ### When to Use Sharc.Vector
 
-- **≤100K vectors** — flat scan is fast enough (~50-100 ms for 384-dim)
+- **≤1M vectors** — HNSW index for ANN search, flat scan fallback for small datasets
 - **Embedded/edge/mobile** — no server process, no network round-trip
 - **RAG with metadata** — pre-filter by category/date/author before similarity search
 - **AI agent context** — agent memory store with semantic retrieval
@@ -142,7 +142,7 @@ computation with automatic hardware dispatch (SSE2 → AVX2 → AVX-512).
 
 ### When to Use a Dedicated Vector DB
 
-- **>100K vectors** — HNSW/IVF indices are essential at scale
+- **>1M vectors** — quantization and distributed sharding needed at scale
 - **Real-time index updates** — continuous embedding ingestion at high throughput
 - **Multi-tenant** — isolation, access control, per-tenant quotas
 - **Distributed** — data spans multiple nodes with replication
@@ -279,9 +279,9 @@ int dims = BlobVectorCodec.GetDimensions(blobBytes.Length); // 1536 bytes → 38
 
 ## Limitations
 
-1. **Flat scan only** — no ANN index (HNSW, IVF). Practical for ≤100K vectors.
+1. **HNSW index** — built-in HNSW for ANN search (no IVF/PQ). Flat scan for small datasets; HNSW for larger ones.
 2. **Single-threaded search** — no parallel distance computation (yet).
-3. **No incremental index** — every search scans all qualifying rows.
+3. **Incremental mutations** — HNSW supports Upsert/Delete with periodic MergePendingMutations.
 4. **Float32 only** — no float16/int8 quantization (yet).
 5. **Separate project** — requires `Sharc.Vector` package (adds `System.Numerics.Tensors` dependency).
 

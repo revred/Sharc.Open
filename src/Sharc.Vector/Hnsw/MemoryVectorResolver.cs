@@ -4,47 +4,56 @@
 namespace Sharc.Vector.Hnsw;
 
 /// <summary>
-/// In-memory vector resolver. Used during index construction (when all vectors
-/// are already loaded) and in unit tests. Supports post-build growth via
-/// <see cref="AppendVector"/> and in-place updates via <see cref="UpdateVector"/>.
+/// In-memory vector resolver backed by a jagged float array.
+/// Supports post-build growth via <see cref="AppendVector"/>
+/// and in-place updates via <see cref="UpdateVector"/>.
 /// </summary>
 internal sealed class MemoryVectorResolver : IVectorResolver
 {
+    private readonly int _dimensions;
     private float[][] _vectors;
     private int _count;
 
     internal MemoryVectorResolver(float[][] vectors)
     {
         ArgumentNullException.ThrowIfNull(vectors);
-        _vectors = vectors;
         _count = vectors.Length;
+
         if (vectors.Length == 0)
         {
-            Dimensions = 0;
+            _vectors = [];
+            _dimensions = 0;
             return;
         }
 
         if (vectors[0] == null)
             throw new ArgumentException("Vector 0 is null.", nameof(vectors));
 
-        Dimensions = vectors[0].Length;
+        _dimensions = vectors[0].Length;
 
         for (int i = 1; i < vectors.Length; i++)
         {
             if (vectors[i] == null)
                 throw new ArgumentException($"Vector {i} is null.", nameof(vectors));
-            if (vectors[i].Length != Dimensions)
+            if (vectors[i].Length != _dimensions)
             {
                 throw new ArgumentException(
-                    $"Vector {i} has dimension {vectors[i].Length}, expected {Dimensions}.",
+                    $"Vector {i} has dimension {vectors[i].Length}, expected {_dimensions}.",
                     nameof(vectors));
             }
         }
+
+        _vectors = vectors;
     }
 
-    public ReadOnlySpan<float> GetVector(int nodeIndex) => _vectors[nodeIndex];
+    public ReadOnlySpan<float> GetVector(int nodeIndex)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(nodeIndex);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(nodeIndex, _count);
+        return _vectors[nodeIndex];
+    }
 
-    public int Dimensions { get; }
+    public int Dimensions => _dimensions;
 
     /// <summary>
     /// Appends a vector for a newly added graph node. Returns the node index.

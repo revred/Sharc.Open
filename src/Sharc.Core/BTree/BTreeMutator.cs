@@ -405,18 +405,17 @@ internal sealed class BTreeMutator : IDisposable
             // 100-byte database header at offset 0. The B-tree data starts at offset 100.
             // The new left page is a normal page (not page 1), so its B-tree data must
             // start at offset 0. Rebuild it rather than copying verbatim.
-            if (pageNum == 1 && isLeaf)
+            if (pageNum == 1)
             {
-                var leftBuf = RentPageBuffer();
-                _rewriter.BuildLeafPage(leftBuf, 0, cellBuf, cells[..(splitIdx + 1)]);
-                WritePageBuffer(newLeftPage, leftBuf);
-            }
-            else if (pageNum == 1 && !isLeaf)
-            {
-                CellParser.ParseTableInteriorCell(medianSpan, out uint leftChild, out _);
-                var leftBuf = RentPageBuffer();
-                _rewriter.BuildInteriorPage(leftBuf, 0, cellBuf, cells[..splitIdx], leftChild);
-                WritePageBuffer(newLeftPage, leftBuf);
+                var newLeftBuf = RentPageBuffer();
+                if (isLeaf)
+                    _rewriter.BuildLeafPage(newLeftBuf, 0, cellBuf, cells[..(splitIdx + 1)]);
+                else
+                {
+                    CellParser.ParseTableInteriorCell(medianSpan, out uint mlc, out _);
+                    _rewriter.BuildInteriorPage(newLeftBuf, 0, cellBuf, cells[..splitIdx], mlc);
+                }
+                WritePageBuffer(newLeftPage, newLeftBuf);
             }
             else
             {
@@ -529,8 +528,10 @@ internal sealed class BTreeMutator : IDisposable
     /// <summary>
     /// Provides the next auto-allocated page number for overflow/split operations.
     /// Called by <see cref="OverflowChainWriter"/> when the freelist is empty.
+    /// Also exposed to <see cref="IndexBTreeMutator"/> via delegate to prevent
+    /// double-allocation when both mutators extend the file within the same transaction.
     /// </summary>
-    private uint AllocateNextPage()
+    internal uint AllocateNextPage()
     {
         if (_nextAllocPage == 0)
             _nextAllocPage = (uint)_source.PageCount + 1;

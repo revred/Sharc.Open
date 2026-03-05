@@ -99,6 +99,67 @@ while (reader.Read())
 }
 ```
 
+## PreparedReader
+
+Zero-allocation cursor reuse for repeated point lookups:
+
+```csharp
+using var prepared = db.PrepareReader("users");
+
+// Seek by primary key — reuses the same cursor, zero allocation per seek
+if (prepared.Seek(42))
+    Console.WriteLine(prepared.GetString(1));
+
+if (prepared.Seek(99))
+    Console.WriteLine(prepared.GetString(1));
+```
+
+With column projection:
+
+```csharp
+using var prepared = db.PrepareReader("users", "id", "name");
+```
+
+## Pagination (AfterRowId)
+
+Resume a scan after a specific rowid for efficient pagination:
+
+```csharp
+using var reader = db.CreateReader("users");
+long lastRowId = 0;
+int pageSize = 50;
+
+// Page 1
+reader.AfterRowId(lastRowId);
+int count = 0;
+while (reader.Read() && count < pageSize)
+{
+    lastRowId = reader.RowId;
+    count++;
+}
+
+// Page 2 — continues from where page 1 left off
+reader.AfterRowId(lastRowId);
+count = 0;
+while (reader.Read() && count < pageSize)
+{
+    lastRowId = reader.RowId;
+    count++;
+}
+```
+
+## RowId Property
+
+Access the current row's SQLite rowid:
+
+```csharp
+while (reader.Read())
+{
+    long rowId = reader.RowId;
+    Console.WriteLine($"Row {rowId}: {reader.GetString(1)}");
+}
+```
+
 ## Column Metadata
 
 ```csharp

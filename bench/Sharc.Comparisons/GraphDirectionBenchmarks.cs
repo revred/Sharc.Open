@@ -24,15 +24,11 @@ public class GraphDirectionBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        var dir = Path.Combine(Path.GetTempPath(), "sharc_graph_direction");
-        Directory.CreateDirectory(dir);
-        _dbPath = Path.Combine(dir, "graph_direction.db");
-
-        if (File.Exists(_dbPath)) File.Delete(_dbPath);
+        _dbPath = BenchmarkTempDb.CreatePath("graph_direction");
         GraphGenerator.GenerateSQLite(_dbPath, nodeCount: 5000, edgeCount: 15000);
-        _dbBytes = File.ReadAllBytes(_dbPath);
+        _dbBytes = BenchmarkTempDb.ReadAllBytesWithRetry(_dbPath);
 
-        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly;Pooling=False");
         _conn.Open();
 
         // Sharc Setup
@@ -54,6 +50,7 @@ public class GraphDirectionBenchmarks
     {
         _conn?.Dispose();
         _graph?.Dispose();
+        BenchmarkTempDb.TryDelete(_dbPath);
     }
 
     private static readonly TraversalPolicy IncomingPolicy = new()

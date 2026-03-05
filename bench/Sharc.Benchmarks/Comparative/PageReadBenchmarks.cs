@@ -134,22 +134,14 @@ public class PageReadBenchmarks
         int totalCells = 0;
         // Page 1 starts at offset 100 (after db header)
         var page1Span = _dbBytes.AsSpan(100, _pageSize - 100);
-        try
-        {
-            var hdr = BTreePageHeader.Parse(page1Span);
-            totalCells += hdr.CellCount;
-        }
-        catch { /* non-btree page, skip */ }
+        if (TryParseBTreeHeader(page1Span, out var page1Header))
+            totalCells += page1Header.CellCount;
 
         for (int p = 1; p < _pageCount && (p + 1) * _pageSize <= _dbBytes.Length; p++)
         {
             var pageSpan = _dbBytes.AsSpan(p * _pageSize, _pageSize);
-            try
-            {
-                var hdr = BTreePageHeader.Parse(pageSpan);
+            if (TryParseBTreeHeader(pageSpan, out var hdr))
                 totalCells += hdr.CellCount;
-            }
-            catch { /* non-btree page (freelist, overflow), skip */ }
         }
         return totalCells;
     }
@@ -200,12 +192,8 @@ public class PageReadBenchmarks
         {
             var page = _mmapSource.GetPage(p);
             var offset = p == 1 ? 100 : 0; // page 1 has 100-byte db header prefix
-            try
-            {
-                var hdr = BTreePageHeader.Parse(page[offset..]);
+            if (TryParseBTreeHeader(page[offset..], out var hdr))
                 totalCells += hdr.CellCount;
-            }
-            catch { /* non-btree page, skip */ }
         }
         return totalCells;
     }
@@ -243,14 +231,24 @@ public class PageReadBenchmarks
         {
             var page = _fileSource.GetPage(p);
             var offset = p == 1 ? 100 : 0;
-            try
-            {
-                var hdr = BTreePageHeader.Parse(page[offset..]);
+            if (TryParseBTreeHeader(page[offset..], out var hdr))
                 totalCells += hdr.CellCount;
-            }
-            catch { /* non-btree page, skip */ }
         }
         return totalCells;
+    }
+
+    private static bool TryParseBTreeHeader(ReadOnlySpan<byte> pageBytes, out BTreePageHeader header)
+    {
+        header = default;
+        if (pageBytes.Length < SQLiteLayout.TableLeafHeaderSize)
+            return false;
+
+        byte pageType = pageBytes[0];
+        if (pageType is not (0x02 or 0x05 or 0x0A or 0x0D))
+            return false;
+
+        header = BTreePageHeader.Parse(pageBytes);
+        return true;
     }
 
     // --- SQLite: equivalent reads via SQL (interop + managed object allocations) ---

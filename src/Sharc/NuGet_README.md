@@ -53,4 +53,4 @@ while (typed.Read())
 
 Sharc is optimized for **point lookups**, **structured AI context**, and **embedded scenarios**. It is a complement to SQLite, not a full replacement. Use Sharc when performance, allocation, or zero-dependency deployment is critical.
 
-[Full Documentation & Benchmarks](https://github.com/revred/Sharc) | [Live Arena](https://revred.github.io/Sharc/)
+[Full Documentation & Benchmarks](https://github.com/revred/Sharc) | [Live Arena](https://revred.github.io/Sharc.Open/)

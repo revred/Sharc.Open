@@ -32,6 +32,22 @@ public sealed class BlobVectorCodecTests
     }
 
     [Fact]
+    public void Decode_InvalidByteLength_ThrowsFormatException()
+    {
+        byte[] invalid = [1, 2, 3];
+        Assert.Throws<FormatException>(() => BlobVectorCodec.Decode(invalid));
+    }
+
+    [Fact]
+    public void TryDecode_InvalidByteLength_ReturnsFalse()
+    {
+        byte[] invalid = [1, 2, 3];
+        bool ok = BlobVectorCodec.TryDecode(invalid, out ReadOnlySpan<float> decoded);
+        Assert.False(ok);
+        Assert.True(decoded.IsEmpty);
+    }
+
+    [Fact]
     public void GetDimensions_384Dim_Returns384()
     {
         int blobSize = 384 * sizeof(float); // 1536 bytes
@@ -49,6 +65,12 @@ public sealed class BlobVectorCodecTests
     public void GetDimensions_ZeroBytes_ReturnsZero()
     {
         Assert.Equal(0, BlobVectorCodec.GetDimensions(0));
+    }
+
+    [Fact]
+    public void GetDimensions_InvalidByteLength_ThrowsFormatException()
+    {
+        Assert.Throws<FormatException>(() => BlobVectorCodec.GetDimensions(6));
     }
 
     [Fact]

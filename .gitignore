@@ -14,6 +14,7 @@ nul
 secrets/
 published/
 Certificates/
+.sharc/
 
 
 # 3rdparty build artifacts (db rebuild infra [rust] + build output)

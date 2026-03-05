@@ -49,6 +49,7 @@ public sealed class IndexedDbEngine
         _initialized = true;
         _lastUserCount = userCount;
         _lastNodeCount = nodeCount;
+        Console.WriteLine($"[IndexedDB] Initialized: {userCount} users, {nodeCount} nodes");
     }
 
     public async Task<EngineBaseResult> RunSlide(string slideId, double scale)
@@ -347,10 +348,12 @@ public sealed class IndexedDbEngine
 
     /// <summary>
     /// Extracts rows from the SQLite byte[] and builds IndexedDB store config objects.
+    /// Uses a fixed path in the Emscripten virtual filesystem (WASM-safe).
+    /// Path.GetTempFileName() can fail in WASM — use /tmp/ directly.
     /// </summary>
     private static object[] ExtractStoreConfigs(byte[] dbBytes)
     {
-        var tempPath = Path.GetTempFileName();
+        const string tempPath = "/tmp/sharc_idb_extract.db";
         try
         {
             File.WriteAllBytes(tempPath, dbBytes);

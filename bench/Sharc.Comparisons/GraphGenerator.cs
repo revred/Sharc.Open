@@ -14,7 +14,7 @@ public static class GraphGenerator
     {
         if (File.Exists(dbPath)) File.Delete(dbPath);
 
-        using var conn = new SqliteConnection($"Data Source={dbPath}");
+        using var conn = new SqliteConnection($"Data Source={dbPath};Pooling=False");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -86,15 +86,7 @@ public static class GraphGenerator
             epKind.Value = random.Next(10, 20); // 10=Defines, 15=Calls
             epTarget.Value = random.Next(1, nodeCount + 1);
             epData.Value = "{}";
-            
-            try
-            {
-                edgeCmd.ExecuteNonQuery();
-            }
-            catch (SqliteException) 
-            {
-                // Ignore duplicates on PK violation
-            }
+            edgeCmd.ExecuteNonQuery();
         }
 
         tx.Commit();

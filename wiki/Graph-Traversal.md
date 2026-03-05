@@ -239,6 +239,121 @@ foreach (var node in result.Nodes)
 }
 ```
 
+## Cypher Query Language
+
+Full tokenizer, parser, compiler, and executor pipeline for graph pattern matching:
+
+```csharp
+// One-shot Cypher query
+var result = graph.Cypher(
+    "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.name = 'Alice' RETURN b.name");
+
+foreach (var node in result.Nodes)
+    Console.WriteLine(node.Record.Id);
+```
+
+### PreparedCypher
+
+Pre-compile a Cypher query for repeated execution:
+
+```csharp
+using var cypher = graph.PrepareCypher(
+    "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b");
+
+// Execute from all start points
+var allResults = cypher.Execute();
+
+// Execute from a specific start node
+var fromAlice = cypher.Execute(new NodeKey(aliceId));
+
+// Execute between two specific nodes
+var path = cypher.Execute(new NodeKey(aliceId), new NodeKey(bobId));
+```
+
+## GraphWriter
+
+Full read/write graph operations for creating and modifying knowledge graphs:
+
+```csharp
+using var writer = new GraphWriter(sharcWriter, schema, ledger, signer);
+
+// Intern — create or find a node by kind + name
+NodeKey alice = writer.Intern("alice-001", new NodeKey(1),
+    ConceptKind.Person, jsonData: "{\"role\":\"engineer\"}");
+
+NodeKey bob = writer.Intern("bob-002", new NodeKey(2),
+    ConceptKind.Person, jsonData: "{\"role\":\"manager\"}");
+
+// Link — create a typed, weighted, directional edge
+long edgeId = writer.Link("edge-001", alice, bob,
+    RelationKind.Knows, weight: 0.9f);
+
+// Remove — delete a node and its edges
+bool removed = writer.Remove(new NodeKey(oldNodeId));
+
+// Unlink — delete a specific edge by its row ID
+bool unlinked = writer.Unlink(edgeId);
+```
+
+### GraphWriter Methods
+
+| Method | Signature | Description |
+|:---|:---|:---|
+| `Intern` | `Intern(id, key, kind, jsonData, nodeAlias?, tokens?)` | Create or find a node |
+| `Link` | `Link(id, origin, target, kind, jsonData, weight)` | Create a directional edge |
+| `Remove` | `Remove(key)` | Delete a node and all its edges |
+| `Unlink` | `Unlink(edgeRowId)` | Delete a single edge |
+
+## Graph Algorithms
+
+Graph algorithms are available internally through `SharcContextGraph`:
+
+### Shortest Path
+
+```csharp
+var path = graph.ShortestPath(
+    new NodeKey(startId),
+    new NodeKey(endId),
+    new TraversalPolicy { MaxDepth = 10 });
+
+if (path != null)
+{
+    Console.WriteLine($"Path length: {path.Count} hops");
+    foreach (var nodeKey in path)
+        Console.WriteLine($"  -> {nodeKey.Value}");
+}
+```
+
+### PageRank
+
+Identify influential nodes in the graph:
+
+```csharp
+var ranks = PageRankComputer.Compute(graph, iterations: 20, dampingFactor: 0.85);
+foreach (var (nodeId, rank) in ranks.OrderByDescending(r => r.Value).Take(10))
+    Console.WriteLine($"Node {nodeId}: rank {rank:F4}");
+```
+
+### Degree Centrality
+
+Find the most connected nodes:
+
+```csharp
+var centrality = DegreeCentralityComputer.Compute(graph);
+foreach (var result in centrality.OrderByDescending(r => r.TotalDegree).Take(10))
+    Console.WriteLine($"Node {result.Key}: in={result.InDegree}, out={result.OutDegree}");
+```
+
+### Topological Sort
+
+Dependency ordering for DAGs:
+
+```csharp
+var sorted = TopologicalSortComputer.Compute(graph, kind: RelationKind.Imports);
+foreach (var nodeKey in sorted)
+    Console.WriteLine(nodeKey.Value);
+```
+
 ## Performance
 
 | Operation | Sharc | SQLite | Speedup |

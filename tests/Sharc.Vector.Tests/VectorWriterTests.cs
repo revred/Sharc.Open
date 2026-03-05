@@ -159,4 +159,80 @@ public sealed class VectorWriterTests : IDisposable
             writer.InsertVector("embeddings", "vector", empty,
                 ("label", "bad")));
     }
+
+    [Fact]
+    public void Vector_InvalidProbePayload_ThrowsInvalidOperationException()
+    {
+        using var writer = SharcWriter.From(_db);
+
+        byte[] labelBytes = Encoding.UTF8.GetBytes("bad_probe");
+        byte[] catBytes = Encoding.UTF8.GetBytes("A");
+        byte[] invalidVectorBlob = [1, 2, 3]; // not a multiple of sizeof(float)
+
+        writer.Insert("embeddings",
+            ColumnValue.FromInt64(1, 1),
+            ColumnValue.Text(2L * labelBytes.Length + 13, labelBytes),
+            ColumnValue.Text(2L * catBytes.Length + 13, catBytes),
+            ColumnValue.FromDouble(0.1),
+            ColumnValue.Blob(2L * invalidVectorBlob.Length + 12, invalidVectorBlob));
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            _db.Vector("embeddings", "vector", DistanceMetric.Cosine));
+
+        Assert.Contains("invalid vector payload", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void NearestTo_RowDimensionMismatch_ThrowsInvalidOperationException()
+    {
+        using var writer = SharcWriter.From(_db);
+
+        byte[] label1 = Encoding.UTF8.GetBytes("ok");
+        byte[] cat1 = Encoding.UTF8.GetBytes("A");
+        byte[] vec4 = BlobVectorCodec.Encode(new float[] { 1f, 0f, 0f, 0f });
+        writer.Insert("embeddings",
+            ColumnValue.FromInt64(1, 1),
+            ColumnValue.Text(2L * label1.Length + 13, label1),
+            ColumnValue.Text(2L * cat1.Length + 13, cat1),
+            ColumnValue.FromDouble(1.0),
+            ColumnValue.Blob(2L * vec4.Length + 12, vec4));
+
+        byte[] label2 = Encoding.UTF8.GetBytes("bad_dims");
+        byte[] cat2 = Encoding.UTF8.GetBytes("A");
+        byte[] vec3 = BlobVectorCodec.Encode(new float[] { 1f, 0f, 0f }); // 3-dim mismatch
+        writer.Insert("embeddings",
+            ColumnValue.FromInt64(1, 2),
+            ColumnValue.Text(2L * label2.Length + 13, label2),
+            ColumnValue.Text(2L * cat2.Length + 13, cat2),
+            ColumnValue.FromDouble(2.0),
+            ColumnValue.Blob(2L * vec3.Length + 12, vec3));
+
+        using var query = _db.Vector("embeddings", "vector", DistanceMetric.Cosine);
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            query.NearestTo(new float[] { 1f, 0f, 0f, 0f }, k: 2));
+
+        Assert.Contains("has 3 dimensions", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void BuildHnswIndex_InvalidPayload_ThrowsInvalidOperationException()
+    {
+        using var writer = SharcWriter.From(_db);
+
+        byte[] labelBytes = Encoding.UTF8.GetBytes("bad_index");
+        byte[] catBytes = Encoding.UTF8.GetBytes("A");
+        byte[] invalidVectorBlob = [0x01, 0x02, 0x03];
+
+        writer.Insert("embeddings",
+            ColumnValue.FromInt64(1, 1),
+            ColumnValue.Text(2L * labelBytes.Length + 13, labelBytes),
+            ColumnValue.Text(2L * catBytes.Length + 13, catBytes),
+            ColumnValue.FromDouble(0.0),
+            ColumnValue.Blob(2L * invalidVectorBlob.Length + 12, invalidVectorBlob));
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            _db.BuildHnswIndex("embeddings", "vector", DistanceMetric.Cosine, persist: false));
+
+        Assert.Contains("invalid vector payload", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
 }

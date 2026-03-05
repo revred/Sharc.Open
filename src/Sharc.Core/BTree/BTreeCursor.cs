@@ -5,6 +5,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using Sharc.Core.Format;
 using Sharc.Exceptions;
 
@@ -124,6 +125,7 @@ internal sealed class BTreeCursor<TPageSource> : IBTreeCursor
     }
 
     /// <inheritdoc />
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool MoveNext()
     {
         // Return any previously assembled overflow buffer

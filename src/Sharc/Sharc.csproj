@@ -18,6 +18,7 @@
     <InternalsVisibleTo Include="Sharc.Graph" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="..\Sharc.Base\Sharc.Base.csproj" />
     <ProjectReference Include="..\Sharc.Core\Sharc.Core.csproj" />
     <ProjectReference Include="..\Sharc.Crypto\Sharc.Crypto.csproj" />
     <ProjectReference Include="..\Sharc.Query\Sharc.Query.csproj" />

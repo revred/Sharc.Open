@@ -269,7 +269,7 @@ public sealed class BTreeMutatorStressTests
         uint root = 2;
         root = mutator.Insert(root, 1, MakeRecord(1, "only"));
 
-        var (found, newRoot) = mutator.Update(root, 999, MakeRecord(999, "ghost"));
+        var (found, newRoot) = mutator.Update(root, 999, MakeRecord(999, "sample"));
         Assert.False(found);
 
         // Original row unchanged

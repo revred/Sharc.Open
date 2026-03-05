@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Sharc.Base</RootNamespace>
+    <AssemblyName>Sharc.Base</AssemblyName>
+    <Description>Interfaces-only base contracts for Sharc context and impact abstractions.</Description>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+</Project>

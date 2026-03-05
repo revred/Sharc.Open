@@ -17,6 +17,8 @@ namespace Sharc;
 /// <para>After the first <see cref="CreateReader"/> call on each thread, the cursor and reader
 /// are cached. Subsequent calls reset traversal state via <see cref="IBTreeCursor.Reset"/> and
 /// reuse the same buffers, eliminating per-call allocation and setup overhead.</para>
+/// <para>Dispose is safe to call concurrently with CreateReader: Dispose acquires an exclusive
+/// write lock and waits for all active CreateReader calls to finish before cleaning up.</para>
 /// </remarks>
 public sealed class PreparedReader : IPreparedReader
 {
@@ -28,6 +30,10 @@ public sealed class PreparedReader : IPreparedReader
     // Per-thread execution state
     private readonly ThreadLocal<ReaderSlot> _slot;
     private volatile bool _disposed;
+
+    // Protects _slot access against concurrent Dispose.
+    // CreateReader: read lock (concurrent). Dispose: write lock (exclusive).
+    private readonly ReaderWriterLockSlim _guard = new(LockRecursionPolicy.NoRecursion);
 
     private sealed class ReaderSlot : IDisposable
     {
@@ -67,32 +73,53 @@ public sealed class PreparedReader : IPreparedReader
     /// <exception cref="ObjectDisposedException">The prepared reader has been disposed.</exception>
     public SharcDataReader CreateReader()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-
-        var slot = _slot.Value;
-        if (slot != null)
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterReadLock();
+        try
         {
-            slot.Reader.ResetForReuse(null);
-            return slot.Reader;
-        }
+            ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // First call on this thread: create cursor + reader
-        var cursor = _db.CreateTableCursorForPrepared(_table);
-        var reader = new SharcDataReader(cursor, _db.Decoder, _config);
-        _slot.Value = new ReaderSlot(cursor, reader);
-        return reader;
+            var slot = _slot.Value;
+            if (slot != null)
+            {
+                slot.Reader.ResetForReuse(null);
+                return slot.Reader;
+            }
+
+            // First call on this thread: create cursor + reader
+            var cursor = _db.CreateTableCursorForPrepared(_table);
+            var reader = new SharcDataReader(cursor, _db.Decoder, _config);
+            _slot.Value = new ReaderSlot(cursor, reader);
+            return reader;
+        }
+        finally
+        {
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitReadLock();
+        }
     }
 
     /// <inheritdoc/>
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
 
-        // Clean up all per-thread slots
-        foreach (var slot in _slot.Values)
-            slot.Dispose();
+        // Write lock: waits for all active CreateReader calls to finish before cleanup.
+        if (!SharcRuntime.IsSingleThreaded) _guard.EnterWriteLock();
+        try
+        {
+            if (_disposed) return;
+            _disposed = true;
 
-        _slot.Dispose();
+            // Clean up all per-thread slots
+            foreach (var slot in _slot.Values)
+                slot.Dispose();
+
+            _slot.Dispose();
+        }
+        finally
+        {
+            if (!SharcRuntime.IsSingleThreaded) _guard.ExitWriteLock();
+        }
+
+        if (!SharcRuntime.IsSingleThreaded) _guard.Dispose();
     }
 }

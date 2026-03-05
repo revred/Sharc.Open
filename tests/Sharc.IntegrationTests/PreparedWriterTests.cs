@@ -219,7 +219,7 @@ public sealed class PreparedWriterTests : IDisposable
 
         bool updated = prepared.Update(999,
             ColumnValue.FromInt64(1, 999),
-            ColumnValue.Text(25, System.Text.Encoding.UTF8.GetBytes("Ghost")),
+            ColumnValue.Text(25, System.Text.Encoding.UTF8.GetBytes("Sample")),
             ColumnValue.FromInt64(2, 0),
             ColumnValue.FromDouble(0.0),
             ColumnValue.Null());

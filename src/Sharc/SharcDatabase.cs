@@ -161,6 +161,38 @@ public sealed class SharcDatabase : IDisposable
         }
     }
 
+    /// <summary>
+    /// Performs Step 1 of folding: Reorders records for maximum B-tree locality.
+    /// Requires agent entitlement.
+    /// </summary>
+    public void FoldFast(string agentId, string tableName, string[] sortColumns)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var service = new Storage.SharcFoldService(this);
+        service.FoldFast(agentId, tableName, sortColumns);
+    }
+
+    /// <summary>
+    /// Performs Step 2 of folding: PCodec bitwise compression.
+    /// Requires agent entitlement.
+    /// </summary>
+    public void FoldMax(string agentId, string tableName)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var service = new Storage.SharcFoldService(this);
+        service.FoldMax(agentId, tableName);
+    }
+
+    /// <summary>
+    /// Reverts a table to its unfolded state.
+    /// Requires agent entitlement.
+    /// </summary>
+    public void Unfold(string agentId, string tableName)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var service = new Storage.SharcFoldService(this);
+        service.Unfold(agentId, tableName);
+    }
 
     internal SharcDatabase(ProxyPageSource proxySource, IPageSource rawSource, DatabaseHeader header,
         IBTreeReader bTreeReader, IRecordDecoder recordDecoder,
@@ -448,6 +480,22 @@ public sealed class SharcDatabase : IDisposable
         {
             var node = FilterTreeCompiler.CompileBaked(filter, table.Columns, FindIntegerPrimaryKeyOrdinal(table.Columns));
             var cursor = TryCreateIndexSeekCursor(filter, table) ?? CreateTableCursor(table);
+            return new SharcDataReader(cursor, _recordDecoder, new SharcDataReader.CursorReaderConfig
+            {
+                Columns = table.Columns,
+                Projection = projection,
+                BTreeReader = _bTreeReader,
+                TableIndexes = table.Indexes,
+                FilterNode = node
+            });
+        }
+
+        if (filters is { Length: > 0 } &&
+            TryBuildLegacyFilterExpression(filters, out var legacyExpression))
+        {
+            var node = FilterTreeCompiler.CompileBaked(
+                legacyExpression, table.Columns, FindIntegerPrimaryKeyOrdinal(table.Columns));
+            var cursor = TryCreateIndexSeekCursor(filters, table) ?? CreateTableCursor(table);
             return new SharcDataReader(cursor, _recordDecoder, new SharcDataReader.CursorReaderConfig
             {
                 Columns = table.Columns,
@@ -1139,6 +1187,145 @@ public sealed class SharcDatabase : IDisposable
         }
 
         return result;
+    }
+
+    private static bool TryBuildLegacyFilterExpression(
+        SharcFilter[] filters,
+        out IFilterStar expression)
+    {
+        var predicates = new IFilterStar[filters.Length];
+        for (int i = 0; i < filters.Length; i++)
+        {
+            if (!TryBuildLegacyPredicate(filters[i], out predicates[i]))
+            {
+                expression = default!;
+                return false;
+            }
+        }
+
+        expression = predicates.Length == 1
+            ? predicates[0]
+            : FilterStar.And(predicates);
+        return true;
+    }
+
+    private static bool TryBuildLegacyPredicate(
+        SharcFilter filter,
+        out IFilterStar predicate)
+    {
+        predicate = default!;
+        if (filter.Value is null)
+            return false;
+
+        var column = FilterStar.Column(filter.ColumnName);
+
+        if (TryGetLegacyIntegerValue(filter.Value, out long intValue))
+            return TryBuildIntegerPredicate(column, filter.Operator, intValue, out predicate);
+
+        if (TryGetLegacyRealValue(filter.Value, out double realValue))
+            return TryBuildRealPredicate(column, filter.Operator, realValue, out predicate);
+
+        if (filter.Value is string textValue)
+            return TryBuildTextPredicate(column, filter.Operator, textValue, out predicate);
+
+        if (filter.Value is decimal decimalValue)
+            return TryBuildDecimalPredicate(column, filter.Operator, decimalValue, out predicate);
+
+        if (filter.Value is Guid guidValue)
+            return TryBuildGuidPredicate(column, filter.Operator, guidValue, out predicate);
+
+        return false;
+    }
+
+    private static bool TryBuildIntegerPredicate(
+        ColumnRef column,
+        SharcOperator op,
+        long value,
+        out IFilterStar predicate)
+    {
+        predicate = op switch
+        {
+            SharcOperator.Equal => column.Eq(value),
+            SharcOperator.NotEqual => column.Neq(value),
+            SharcOperator.LessThan => column.Lt(value),
+            SharcOperator.LessOrEqual => column.Lte(value),
+            SharcOperator.GreaterThan => column.Gt(value),
+            SharcOperator.GreaterOrEqual => column.Gte(value),
+            _ => default!
+        };
+        return predicate != null;
+    }
+
+    private static bool TryBuildRealPredicate(
+        ColumnRef column,
+        SharcOperator op,
+        double value,
+        out IFilterStar predicate)
+    {
+        predicate = op switch
+        {
+            SharcOperator.Equal => column.Eq(value),
+            SharcOperator.NotEqual => column.Neq(value),
+            SharcOperator.LessThan => column.Lt(value),
+            SharcOperator.LessOrEqual => column.Lte(value),
+            SharcOperator.GreaterThan => column.Gt(value),
+            SharcOperator.GreaterOrEqual => column.Gte(value),
+            _ => default!
+        };
+        return predicate != null;
+    }
+
+    private static bool TryBuildTextPredicate(
+        ColumnRef column,
+        SharcOperator op,
+        string value,
+        out IFilterStar predicate)
+    {
+        predicate = op switch
+        {
+            SharcOperator.Equal => column.Eq(value),
+            SharcOperator.NotEqual => column.Neq(value),
+            SharcOperator.LessThan => column.Lt(value),
+            SharcOperator.LessOrEqual => column.Lte(value),
+            SharcOperator.GreaterThan => column.Gt(value),
+            SharcOperator.GreaterOrEqual => column.Gte(value),
+            _ => default!
+        };
+        return predicate != null;
+    }
+
+    private static bool TryBuildDecimalPredicate(
+        ColumnRef column,
+        SharcOperator op,
+        decimal value,
+        out IFilterStar predicate)
+    {
+        predicate = op switch
+        {
+            SharcOperator.Equal => column.Eq(value),
+            SharcOperator.NotEqual => column.Neq(value),
+            SharcOperator.LessThan => column.Lt(value),
+            SharcOperator.LessOrEqual => column.Lte(value),
+            SharcOperator.GreaterThan => column.Gt(value),
+            SharcOperator.GreaterOrEqual => column.Gte(value),
+            _ => default!
+        };
+        return predicate != null;
+    }
+
+    private static bool TryBuildGuidPredicate(
+        ColumnRef column,
+        SharcOperator op,
+        Guid value,
+        out IFilterStar predicate)
+    {
+        predicate = op switch
+        {
+            SharcOperator.Equal => column.Eq(value),
+            SharcOperator.NotEqual => column.Neq(value),
+            _ => default!
+        };
+        return predicate != null;
     }
 
     private static bool TryMapLegacyOperator(SharcOperator op, out Intent.IntentOp mappedOp)
