@@ -32,16 +32,21 @@ internal sealed class SchemaReader
         _recordDecoder = recordDecoder;
     }
 
+    private SharcSchema? _cachedSchema;
+
     /// <summary>
     /// Reads the sqlite_schema from page 1 and builds a full schema.
     /// </summary>
     /// <returns>The parsed database schema.</returns>
     public SharcSchema ReadSchema()
     {
+        if (_cachedSchema != null) return _cachedSchema;
+
         var columnBuffer = ArrayPool<ColumnValue>.Shared.Rent(5);
         try
         {
-        return ReadSchemaCore(columnBuffer);
+            _cachedSchema = ReadSchemaCore(columnBuffer);
+            return _cachedSchema;
         }
         finally
         {
