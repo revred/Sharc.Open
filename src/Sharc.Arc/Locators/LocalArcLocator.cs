@@ -41,13 +41,18 @@ public sealed class LocalArcLocator : IArcLocator
 
         path = Path.GetFullPath(path);
 
-        // 2. Path traversal defense: ensure resolved path doesn't escape base directory
+        // 2. Path traversal defense: ensure resolved path doesn't escape base directory.
+        //    Uses separator-safe boundary check: baseDir must end with directory separator
+        //    to prevent sibling-prefix attacks (e.g., /data matching /data-other).
         if (options.BaseDirectory != null)
         {
             string baseDir = Path.GetFullPath(options.BaseDirectory);
-            if (!path.StartsWith(baseDir, StringComparison.OrdinalIgnoreCase))
+            if (!baseDir.EndsWith(Path.DirectorySeparatorChar))
+                baseDir += Path.DirectorySeparatorChar;
+            if (!path.StartsWith(baseDir, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(Path.GetFullPath(options.BaseDirectory), path, StringComparison.OrdinalIgnoreCase))
                 return ArcOpenResult.Failure(ArcAvailability.Untrusted,
-                    $"Path traversal detected: resolved path '{path}' escapes base directory '{baseDir}'.");
+                    $"Path traversal detected: resolved path '{path}' escapes base directory.");
         }
 
         // 3. File existence check
